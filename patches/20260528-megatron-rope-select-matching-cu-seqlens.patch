@@ -1,8 +1,8 @@
 diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
-index 31e06a84b..43a07b100 100644
+index 31e06a84b..7d9656f54 100644
 --- a/megatron/core/transformer/attention.py
 +++ b/megatron/core/transformer/attention.py
-@@ -1277,14 +1277,26 @@ class Attention(MegatronModule, ABC):
+@@ -1277,14 +1277,8 @@ class Attention(MegatronModule, ABC):
              q_pos_emb, k_pos_emb = rotary_pos_emb
  
              if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -14,26 +14,8 @@ index 31e06a84b..43a07b100 100644
 -                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
 -                else:
 -                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
-+                def _select_rope_cu_seqlens(tensor, cu_seqlens, cu_seqlens_padded):
-+                    cp_size = self.pg_collection.cp.size()
-+                    for candidate in (cu_seqlens, cu_seqlens_padded):
-+                        if candidate is None:
-+                            continue
-+                        seqlens = (candidate[1:] - candidate[:-1]) // cp_size
-+                        if int(seqlens.sum().item()) == tensor.size(0):
-+                            return candidate
-+                    return cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-+
-+                cu_seqlens_q = _select_rope_cu_seqlens(
-+                    query,
-+                    packed_seq_params.cu_seqlens_q,
-+                    packed_seq_params.cu_seqlens_q_padded,
-+                )
-+                cu_seqlens_kv = _select_rope_cu_seqlens(
-+                    key,
-+                    packed_seq_params.cu_seqlens_kv,
-+                    packed_seq_params.cu_seqlens_kv_padded,
-+                )
++                cu_seqlens_q = packed_seq_params.cu_seqlens_q
++                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
              else:
                  cu_seqlens_q = cu_seqlens_kv = None
  
