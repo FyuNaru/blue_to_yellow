@@ -24,16 +24,17 @@ slots.
 
 ## Patch order
 
-Apply in `verl release/v0.7.1`:
+Apply in `verl` from a clean tree:
 
 ```bash
-git apply /path/to/blue_to_yellow/patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch
+git apply /path/to/blue_to_yellow/patches/20260528-verl-combined-preserve-real-and-padded-cu-seqlens.patch
 ```
 
-If your verl tree has `preprocess_thd_engine` in `verl/models/mcore/util.py`, also apply:
+This single patch replaces both earlier verl patches:
 
-```bash
-git apply /path/to/blue_to_yellow/patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch
+```text
+20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch
+20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch
 ```
 
 Apply in `Megatron-LM` dev commit `3714d81d418c`:
@@ -44,8 +45,8 @@ git apply /path/to/blue_to_yellow/patches/20260528-megatron-3714d8-rope-select-m
 
 ## What changes
 
-The verl patches preserve both meanings at every `PackedSeqParams` construction point used by the
-current THD paths:
+The combined verl patch preserves both meanings at every `PackedSeqParams` construction point used
+by the current THD paths:
 
 ```text
 cu_seqlens_q/kv          = real lengths

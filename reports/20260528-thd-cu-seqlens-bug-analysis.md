@@ -32,8 +32,7 @@ Megatron RoPE 在运行时根据当前 query/key tensor.size(0) 选择匹配的�
 
 对应最终推荐 patch：
 
-- `patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch`
-- 如果代码里有 `preprocess_thd_engine`，追加 `patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch`
+- `patches/20260528-verl-combined-preserve-real-and-padded-cu-seqlens.patch`
 - `patches/20260528-megatron-3714d8-rope-select-matching-cu-seqlens.patch`
 
 不要再使用之前的 source-only patch：
@@ -410,8 +409,7 @@ Megatron: 根据实际 tensor 选择正确 metadata
 使用这一组：
 
 ```text
-patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch
-patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch  # only if preprocess_thd_engine exists
+patches/20260528-verl-combined-preserve-real-and-padded-cu-seqlens.patch
 patches/20260528-megatron-3714d8-rope-select-matching-cu-seqlens.patch
 ```
 
@@ -446,13 +444,7 @@ patches/20260528-verl-source-real-thd-cu-seqlens.patch
 ```bash
 cd /path/to/verl
 git checkout release/v0.7.1
-git apply /path/to/blue_to_yellow/patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch
-```
-
-如果当前代码里存在 `preprocess_thd_engine`，继续追加：
-
-```bash
-git apply /path/to/blue_to_yellow/patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch
+git apply /path/to/blue_to_yellow/patches/20260528-verl-combined-preserve-real-and-padded-cu-seqlens.patch
 ```
 
 检查结果应该类似：
