@@ -1,3 +1,20 @@
+diff --git a/mindspeed/core/context_parallel/ring_context_parallel/ring_context_parallel.py b/mindspeed/core/context_parallel/ring_context_parallel/ring_context_parallel.py
+index 8c24b4a8..df4bc387 100644
+--- a/mindspeed/core/context_parallel/ring_context_parallel/ring_context_parallel.py
++++ b/mindspeed/core/context_parallel/ring_context_parallel/ring_context_parallel.py
+@@ -937,6 +937,12 @@ class AttentionWithCp(torch.autograd.Function):
+ 
+         if packed_seq_params is not None and packed_seq_params.cu_seqlens_q_padded is not None:
+             cu_seqlens_q_padded_div_cp = packed_seq_params.cu_seqlens_q_padded // cp_config.cp_size
++            if (
++                cu_seqlens_q_padded_div_cp.numel() == 2
++                and int((cu_seqlens_q_padded_div_cp[1] - cu_seqlens_q_padded_div_cp[0]).item()) != q.shape[0]
++            ):
++                cu_seqlens_q_padded_div_cp = cu_seqlens_q_padded_div_cp.clone()
++                cu_seqlens_q_padded_div_cp[1] = cu_seqlens_q_padded_div_cp[0] + q.shape[0]
+             q_index, kv_index = compute_qkv_index(tuple(cu_seqlens_q_padded_div_cp.tolist()))
+             packed_seq_params.q_index = q_index
+             packed_seq_params.kv_index = kv_index
 diff --git a/mindspeed/core/fusions/fused_rope.py b/mindspeed/core/fusions/fused_rope.py
 index 70f7cb08..2ec14cf2 100644
 --- a/mindspeed/core/fusions/fused_rope.py
@@ -35,3 +52,86 @@ index 70f7cb08..2ec14cf2 100644
      if config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
          # setting apply_rope_fusion in config to False so that subsequent queries to this config also return False
          config.apply_rope_fusion = False
+diff --git a/mindspeed/core/transformer/flash_attention/flash_attention/adaptor.py b/mindspeed/core/transformer/flash_attention/flash_attention/adaptor.py
+index 026faec1..bf1c8848 100644
+--- a/mindspeed/core/transformer/flash_attention/flash_attention/adaptor.py
++++ b/mindspeed/core/transformer/flash_attention/flash_attention/adaptor.py
+@@ -18,6 +18,20 @@ except ImportError:
+     rearrange = None
+ 
+ 
++def _maybe_rebuild_single_seq_actual_seq_len(cu_seqlens, total_tokens):
++    if cu_seqlens is None:
++        return None
++    if isinstance(cu_seqlens, list):
++        if len(cu_seqlens) == 2 and cu_seqlens[1] - cu_seqlens[0] != total_tokens:
++            return [cu_seqlens[0], cu_seqlens[0] + total_tokens]
++        return cu_seqlens
++    if cu_seqlens.numel() == 2 and int((cu_seqlens[1] - cu_seqlens[0]).item()) != total_tokens:
++        rebuilt = cu_seqlens.clone()
++        rebuilt[1] = rebuilt[0] + total_tokens
++        return rebuilt
++    return cu_seqlens
++
++
+ def dot_product_attention_forward_impl(
+     self,
+     query: Tensor,
+@@ -47,12 +61,18 @@ def dot_product_attention_forward_impl(
+     scale = self.softmax_scale
+ 
+     if packed_seq_params is not None: # TND
+-        if isinstance(packed_seq_params.cu_seqlens_q, list):
+-            actual_seq_qlen = packed_seq_params.cu_seqlens_q
+-            actual_seq_kvlen = packed_seq_params.cu_seqlens_kv
++        cu_seqlens_q = _maybe_rebuild_single_seq_actual_seq_len(
++            packed_seq_params.cu_seqlens_q, query.shape[0]
++        )
++        cu_seqlens_kv = _maybe_rebuild_single_seq_actual_seq_len(
++            packed_seq_params.cu_seqlens_kv, key.shape[0]
++        )
++        if isinstance(cu_seqlens_q, list):
++            actual_seq_qlen = cu_seqlens_q
++            actual_seq_kvlen = cu_seqlens_kv
+         else:
+-            actual_seq_qlen = packed_seq_params.cu_seqlens_q.tolist()
+-            actual_seq_kvlen = packed_seq_params.cu_seqlens_kv.tolist()
++            actual_seq_qlen = cu_seqlens_q.tolist()
++            actual_seq_kvlen = cu_seqlens_kv.tolist()
+         shape_order = 'TND'
+     else: # SBH
+         actual_seq_qlen = None
+diff --git a/mindspeed/te/pytorch/attention/dot_product_attention/backend.py b/mindspeed/te/pytorch/attention/dot_product_attention/backend.py
+index 249c5d93..76895b78 100644
+--- a/mindspeed/te/pytorch/attention/dot_product_attention/backend.py
++++ b/mindspeed/te/pytorch/attention/dot_product_attention/backend.py
+@@ -9,6 +9,20 @@ import torch_npu
+ from einops import rearrange
+ 
+ 
++def _maybe_rebuild_single_seq_actual_seq_len(cu_seqlens, total_tokens):
++    if cu_seqlens is None:
++        return None
++    if isinstance(cu_seqlens, list):
++        if len(cu_seqlens) == 2 and cu_seqlens[1] - cu_seqlens[0] != total_tokens:
++            return [cu_seqlens[0], cu_seqlens[0] + total_tokens]
++        return cu_seqlens
++    if cu_seqlens.numel() == 2 and int((cu_seqlens[1] - cu_seqlens[0]).item()) != total_tokens:
++        rebuilt = cu_seqlens.clone()
++        rebuilt[1] = rebuilt[0] + total_tokens
++        return rebuilt
++    return cu_seqlens
++
++
+ def get_fa_config(attn_mask_type: str) -> Dict[str, int]:
+     fa_config = {
+         'pre_tokens': 65536,
+@@ -72,6 +86,8 @@ class FlashAttention(torch.nn.Module):
+         elif qkv_format == 'thd':
+             # for thd format (TND shape_order)
+             seq_length, n_head, head_dim = query_layer.shape
++            cu_seqlens_q = _maybe_rebuild_single_seq_actual_seq_len(cu_seqlens_q, seq_length)
++            cu_seqlens_kv = _maybe_rebuild_single_seq_actual_seq_len(cu_seqlens_kv, key_layer.shape[0])
+ 
+             if isinstance(cu_seqlens_q, list):
+                 actual_seq_qlen = cu_seqlens_q
