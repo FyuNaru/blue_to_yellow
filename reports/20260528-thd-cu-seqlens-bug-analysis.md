@@ -18,6 +18,7 @@
 | `tensor size = 284, split_sizes = [296]` | tensor 是未 padding 的，但 RoPE 拿到了 padded 长度 | RoPE metadata 过长 |
 | `aclnnFlashAttentionVarLenScore` 异步报错 | RoPE 之后，varlen attention 也可能拿到不匹配长度 | 同类长度元信息问题 |
 | `tensor size = 584, split_sizes = [284, 293]` | tensor 仍包含 padding slot，但 RoPE 拿到了真实未 padding 长度 | source-only patch 太粗，metadata 变短了 |
+| `tensor size = 300, split_sizes = [304]` | 仍有一个 THD 入口把普通字段也填成 padded 长度 | `preprocess_thd_engine` 路径也需要保留 real/padded 两套长度 |
 
 最终推荐的修复方向是：
 
@@ -32,6 +33,7 @@ Megatron RoPE 在运行时根据当前 query/key tensor.size(0) 选择匹配的�
 对应最终推荐 patch：
 
 - `patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch`
+- 如果代码里有 `preprocess_thd_engine`，追加 `patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch`
 - `patches/20260528-megatron-3714d8-rope-select-matching-cu-seqlens.patch`
 
 不要再使用之前的 source-only patch：
@@ -354,7 +356,31 @@ t.size(0) = 284, seqlens candidates = [284] / [296]
 t.size(0) = 584, seqlens candidates = [284,293] / padded lengths
 ```
 
-### 5.3 Why Both Patches Are Needed
+### 5.3 Additional verl THD Engine Patch
+
+如果 `verl/models/mcore/util.py` 里存在 `preprocess_thd_engine`，还需要追加：
+
+```text
+patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch
+```
+
+这个函数是另一个 `PackedSeqParams` 构造入口。若它仍然写成：
+
+```python
+cu_seqlens_q = cu_seqlens_padded
+cu_seqlens_kv = cu_seqlens_padded
+```
+
+那么 Megatron selector 虽然存在，看到的两个候选仍可能都是 padded，最终仍会触发：
+
+```text
+t.size(0) = 300
+split_sizes = [304]
+```
+
+修法同样是普通字段放真实长度，padded 字段放 padded 长度。
+
+### 5.4 Why Both Patches Are Needed
 
 只改 verl：
 
@@ -385,6 +411,7 @@ Megatron: 根据实际 tensor 选择正确 metadata
 
 ```text
 patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch
+patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch  # only if preprocess_thd_engine exists
 patches/20260528-megatron-3714d8-rope-select-matching-cu-seqlens.patch
 ```
 
@@ -420,6 +447,12 @@ patches/20260528-verl-source-real-thd-cu-seqlens.patch
 cd /path/to/verl
 git checkout release/v0.7.1
 git apply /path/to/blue_to_yellow/patches/20260528-verl-v071-preserve-real-and-padded-cu-seqlens.patch
+```
+
+如果当前代码里存在 `preprocess_thd_engine`，继续追加：
+
+```bash
+git apply /path/to/blue_to_yellow/patches/20260528-verl-thd-engine-preserve-real-and-padded-cu-seqlens.patch
 ```
 
 检查结果应该类似：

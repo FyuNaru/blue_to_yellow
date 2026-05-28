@@ -1,0 +1,16 @@
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+index 00000000..00000000 100644
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -466,9 +466,9 @@ def preprocess_thd_engine(
+ 
+     packed_seq_params = PackedSeqParams(
+         qkv_format="thd",
+-        cu_seqlens_q=cu_seqlens_padded,
++        cu_seqlens_q=cu_seqlens,
+         max_seqlen_q=max_seqlen_in_batch,
+-        cu_seqlens_kv=cu_seqlens_padded,
++        cu_seqlens_kv=cu_seqlens,
+         max_seqlen_kv=max_seqlen_in_batch,
+         cu_seqlens_q_padded=cu_seqlens_padded,
+         cu_seqlens_kv_padded=cu_seqlens_padded,
