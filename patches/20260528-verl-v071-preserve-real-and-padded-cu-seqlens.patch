@@ -1,0 +1,28 @@
+diff --git a/verl/models/mcore/util.py b/verl/models/mcore/util.py
+index b5d16c48..62f40dac 100644
+--- a/verl/models/mcore/util.py
++++ b/verl/models/mcore/util.py
+@@ -117,9 +117,9 @@ def preprocess_packed_seqs(
+ 
+     packed_seq_params = PackedSeqParams(
+         qkv_format="thd",
+-        cu_seqlens_q=cu_seqlens_padded,
++        cu_seqlens_q=cu_seqlens,
+         max_seqlen_q=max_seqlen_in_batch,
+-        cu_seqlens_kv=cu_seqlens_padded,
++        cu_seqlens_kv=cu_seqlens,
+         max_seqlen_kv=max_seqlen_in_batch,
+         cu_seqlens_q_padded=cu_seqlens_padded,
+         cu_seqlens_kv_padded=cu_seqlens_padded,
+@@ -422,9 +422,9 @@ def preprocess_thd_no_padding(
+ 
+     packed_seq_params = PackedSeqParams(
+         qkv_format="thd",
+-        cu_seqlens_q=cu_seqlens_padded,
++        cu_seqlens_q=cu_seqlens,
+         max_seqlen_q=max_seqlen_in_batch,
+-        cu_seqlens_kv=cu_seqlens_padded,
++        cu_seqlens_kv=cu_seqlens,
+         max_seqlen_kv=max_seqlen_in_batch,
+         cu_seqlens_q_padded=cu_seqlens_padded,
+         cu_seqlens_kv_padded=cu_seqlens_padded,
