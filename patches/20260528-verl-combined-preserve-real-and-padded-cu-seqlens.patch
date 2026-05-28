@@ -14,7 +14,7 @@ index b5d16c48..62f40dac 100644
          max_seqlen_kv=max_seqlen_in_batch,
          cu_seqlens_q_padded=cu_seqlens_padded,
          cu_seqlens_kv_padded=cu_seqlens_padded,
-@@ -422,9 +422,9 @@ def preprocess_thd_no_padding(
+@@ -466,9 +466,9 @@ def preprocess_thd_engine(
  
      packed_seq_params = PackedSeqParams(
          qkv_format="thd",
