@@ -1,44 +1,37 @@
-# THD RoPE cu_seqlens mismatch fix
+# MindSpeed-only THD RoPE cu_seqlens mismatch fix
 
-This patch set targets the reproduced error:
+This patch targets the reproduced single-sequence error:
 
 ```text
 RuntimeError: split_with_sizes expects split_sizes to sum exactly to 284,
 but got split_sizes=[296]
 ```
 
-## Patch order
+## Patch
 
-1. Apply `20260528-verl-packed-seq-real-cu-seqlens.patch` in the `verl` repository.
-2. Apply `20260528-megatron-rope-select-matching-cu-seqlens.patch` in the `Megatron-LM` repository.
+Apply `20260528-mindspeed-single-seq-rope-cu-seqlens.patch` in the `MindSpeed` repository.
 
 ## Why
 
-On Megatron-LM dev commit `3714d81d418c9f1bca4594fc35f9e8289f652862`, THD RoPE prefers
-`cu_seqlens_q_padded` and `cu_seqlens_kv_padded` whenever they are present. That is wrong for
-the reproduced failure when the query/key tensors are unpadded:
+On Megatron-LM dev commit `3714d81d418c9f1bca4594fc35f9e8289f652862`, THD RoPE prefers padded
+`cu_seqlens` when the padded fields are present. In the reproduced failure, the local query tensor
+has 284 tokens, but RoPE receives padded local length 296:
 
 ```text
 query.size(0) = 284
 padded local seqlen = 296
 ```
 
-RoPE calls `torch.split(t, seqlens)`, so its `cu_seqlens` must describe the real local THD tensor
-length. The padded fields should remain available for attention kernels that need padded or aligned
-starts.
+MindSpeed can avoid changing Megatron by fixing the `cu_seqlens` passed into MindSpeed's
+`apply_rotary_pos_emb` wrapper. For the current single-sequence case, the real RoPE length can be
+derived from `t.size(0)` and `cp_group.size()`.
 
-The verl patch makes `cu_seqlens_q` and `cu_seqlens_kv` carry the real unpadded lengths, while still
-keeping `cu_seqlens_q_padded` and `cu_seqlens_kv_padded`.
-
-The Megatron-LM patch is intentionally narrow for this reproduced issue: in THD RoPE it uses
-`packed_seq_params.cu_seqlens_q` and `packed_seq_params.cu_seqlens_kv` instead of the padded variants.
+This deliberately does not solve the older multi-sequence packed case because padded lengths alone
+are not enough to recover every original per-sample length.
 
 ## Apply
 
 ```bash
-cd /path/to/verl
-git apply /Users/wangjinyi/workspace/blue_to_yellow/patches/20260528-verl-packed-seq-real-cu-seqlens.patch
-
-cd /path/to/Megatron-LM
-git apply /Users/wangjinyi/workspace/blue_to_yellow/patches/20260528-megatron-rope-select-matching-cu-seqlens.patch
+cd /path/to/MindSpeed
+git apply /Users/wangjinyi/workspace/blue_to_yellow/patches/20260528-mindspeed-single-seq-rope-cu-seqlens.patch
 ```
