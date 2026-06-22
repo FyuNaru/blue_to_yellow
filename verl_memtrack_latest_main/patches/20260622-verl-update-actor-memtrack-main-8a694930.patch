@@ -1,0 +1,75 @@
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 35018ddf..7b53b3d1 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1313,6 +1313,7 @@ class RayPPOTrainer:
+             batch_td,
+             calculate_entropy=calculate_entropy,
+             distillation_use_topk=distillation_use_topk,
++            global_steps=self.global_steps,
+             global_batch_size=ppo_mini_batch_size,
+             mini_batch_size=ppo_mini_batch_size,
+             epochs=ppo_epochs,
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index c65b99e4..180a207a 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -58,6 +58,47 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ 
++def _update_actor_mem_enabled() -> bool:
++    return os.getenv("VERL_UPDATE_ACTOR_MEM", "0") == "1"
++
++
++def _extract_step(data: TensorDict | None) -> str:
++    if data is None:
++        return "unknown"
++    step = tu.get(data, "global_steps", default=None)
++    return "unknown" if step is None else str(step)
++
++
++def _log_update_actor_mem(point: str, rank: int, step: str) -> None:
++    if not _update_actor_mem_enabled():
++        return
++    try:
++        npu = getattr(torch, "npu", None)
++        if npu is None:
++            raise RuntimeError("torch.npu is unavailable")
++        free_bytes, total_bytes = npu.mem_get_info()
++        used_bytes = total_bytes - free_bytes
++        print(
++            (
++                f"[update_actor_mem] point={point} step={step} pid={os.getpid()} "
++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
++                f"free={free_bytes / (1024**3):.2f} GiB "
++                f"used={used_bytes / (1024**3):.2f} GiB "
++                f"total={total_bytes / (1024**3):.2f} GiB"
++            ),
++            flush=True,
++        )
++    except Exception as exc:
++        print(
++            (
++                f"[update_actor_mem_failed] point={point} step={step} pid={os.getpid()} "
++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
++                f"reason={type(exc).__name__}: {exc}"
++            ),
++            flush=True,
++        )
++
++
+ def _with_routing_replay_flag(enabled: bool):
+     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
+ 
+@@ -653,7 +694,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @DistProfiler.annotate(color="red", role="actor_update")
+     @_with_routing_replay_flag(enabled=True)
+     def update_actor(self, data: TensorDict) -> TensorDict:
++        step = _extract_step(data)
++        _log_update_actor_mem("update_actor_begin", self.rank, step)
+         output = self.actor.train_mini_batch(data=data)
++        _log_update_actor_mem("update_actor_end", self.rank, step)
+         return output.cpu() if output is not None else None
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

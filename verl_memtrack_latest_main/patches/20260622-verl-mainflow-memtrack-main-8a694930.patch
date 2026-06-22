@@ -1,0 +1,235 @@
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 35018ddf..eb1f9606 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -75,6 +75,16 @@ from verl.workers.rollout.llm_server import LLMServerManager
+ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+ 
+ 
++def _main_flow_probe_enabled() -> bool:
++    return os.getenv("VERL_MAIN_FLOW_MEM", "0") == "1"
++
++
++def _emit_main_flow_probe(point: str, step: int) -> None:
++    if not _main_flow_probe_enabled():
++        return
++    print(f"[mainflow_probe] point={point} step={step} pid={os.getpid()}", flush=True)
++
++
+ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+     """Apply KL penalty to the token-level rewards.
+ 
+@@ -1262,6 +1272,7 @@ class RayPPOTrainer:
+             batch_td,
+             calculate_entropy=True,
+             calculate_sum_pi_squared=calculate_sum_pi_squared,
++            global_steps=self.global_steps,
+             compute_loss=False,
+         )
+         output = self.actor_rollout_wg.compute_log_prob(batch_td)
+@@ -1313,6 +1324,7 @@ class RayPPOTrainer:
+             batch_td,
+             calculate_entropy=calculate_entropy,
+             distillation_use_topk=distillation_use_topk,
++            global_steps=self.global_steps,
+             global_batch_size=ppo_mini_batch_size,
+             mini_batch_size=ppo_mini_batch_size,
+             epochs=ppo_epochs,
+@@ -1460,6 +1472,7 @@ class RayPPOTrainer:
+ 
+                 is_last_step = self.global_steps >= self.total_training_steps
+                 with marked_timer("step", timing_raw):
++                    _emit_main_flow_probe("step_begin", self.global_steps)
+                     # generate a batch
+                     with marked_timer("gen", timing_raw, color="red"):
+                         if curr_step_profile:
+@@ -1471,6 +1484,7 @@ class RayPPOTrainer:
+ 
+                         timing_raw.update(combined_gen_output.meta_info["timing"])
+                         combined_gen_output.meta_info.pop("timing", None)
++                    _emit_main_flow_probe("after_gen_sleep_replicas", self.global_steps)
+ 
+                     gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
+@@ -1520,6 +1534,7 @@ class RayPPOTrainer:
+ 
+                         # extract reward_tensor and reward_extra_infos_dict for training
+                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
++                    _emit_main_flow_probe("after_reward", self.global_steps)
+ 
+                     # Operating Mode Selection:
+                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+@@ -1536,6 +1551,7 @@ class RayPPOTrainer:
+                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                         )
+                     else:  # Recompute old_log_probs
++                        _emit_main_flow_probe("before_old_log_prob", self.global_steps)
+                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                             entropys = old_log_prob.batch["entropys"]
+@@ -1567,20 +1583,25 @@ class RayPPOTrainer:
+                                 from verl.utils.debug.metrics import calculate_debug_metrics
+ 
+                                 metrics.update(calculate_debug_metrics(batch))
++                        _emit_main_flow_probe("after_old_log_prob", self.global_steps)
+ 
+                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+ 
+                     if self.use_reference_policy:
+                         # compute reference log_prob
++                        _emit_main_flow_probe("before_ref_log_prob", self.global_steps)
+                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                             ref_log_prob = self._compute_ref_log_prob(batch)
+                             batch = batch.union(ref_log_prob)
++                        _emit_main_flow_probe("after_ref_log_prob", self.global_steps)
+ 
+                     # compute values
+                     if self.use_critic:
++                        _emit_main_flow_probe("before_values", self.global_steps)
+                         with marked_timer("values", timing_raw, color="cyan"):
+                             values = self._compute_values(batch)
+                             batch = batch.union(values)
++                        _emit_main_flow_probe("after_values", self.global_steps)
+ 
+                     with marked_timer("adv", timing_raw, color="brown"):
+                         # we combine with rule-based rm
+@@ -1628,6 +1649,7 @@ class RayPPOTrainer:
+                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                             config=self.config.algorithm,
+                         )
++                    _emit_main_flow_probe("after_adv", self.global_steps)
+ 
+                     # update critic
+                     if self.use_critic:
+@@ -1635,15 +1657,20 @@ class RayPPOTrainer:
+                             critic_output = self._update_critic(batch)
+                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                         metrics.update(critic_output_metrics)
++                        _emit_main_flow_probe("after_update_critic", self.global_steps)
+ 
+                     # implement critic warmup
+                     if self.config.trainer.critic_warmup > self.global_steps:
+                         # Still in critic warmup, only update weights to wake up rollout replicas.
++                        _emit_main_flow_probe("before_checkpoint_manager_update_weights", self.global_steps)
+                         self.checkpoint_manager.update_weights(self.global_steps)
++                        _emit_main_flow_probe("after_checkpoint_manager_update_weights", self.global_steps)
+                     else:
+                         # update actor
++                        _emit_main_flow_probe("before_update_actor", self.global_steps)
+                         with marked_timer("update_actor", timing_raw, color="red"):
+                             actor_output = self._update_actor(batch)
++                        _emit_main_flow_probe("after_update_actor", self.global_steps)
+ 
+                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                         esi_close_to_expiration = should_save_ckpt_esi(
+@@ -1666,10 +1693,13 @@ class RayPPOTrainer:
+                                 print("Force saving checkpoint: ESI instance expiration approaching.")
+                             with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                 self._save_checkpoint()
++                            _emit_main_flow_probe("after_save_checkpoint", self.global_steps)
+ 
+                         # update weights from trainer to rollout
++                        _emit_main_flow_probe("before_checkpoint_manager_update_weights", self.global_steps)
+                         with marked_timer("update_weights", timing_raw, color="red"):
+                             self.checkpoint_manager.update_weights(self.global_steps)
++                        _emit_main_flow_probe("after_checkpoint_manager_update_weights", self.global_steps)
+ 
+                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                         metrics.update(actor_output_metrics)
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index c65b99e4..6f185309 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -58,6 +58,47 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ 
++def _main_flow_mem_enabled() -> bool:
++    return os.getenv("VERL_MAIN_FLOW_MEM", "0") == "1"
++
++
++def _extract_step(data: TensorDict | None) -> str:
++    if data is None:
++        return "unknown"
++    step = tu.get(data, "global_steps", default=None)
++    return "unknown" if step is None else str(step)
++
++
++def _log_mainflow_worker_mem(point: str, rank: int, step: str) -> None:
++    if not _main_flow_mem_enabled():
++        return
++    try:
++        npu = getattr(torch, "npu", None)
++        if npu is None:
++            raise RuntimeError("torch.npu is unavailable")
++        free_bytes, total_bytes = npu.mem_get_info()
++        used_bytes = total_bytes - free_bytes
++        print(
++            (
++                f"[mainflow_mem] point={point} step={step} pid={os.getpid()} "
++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
++                f"free={free_bytes / (1024**3):.2f} GiB "
++                f"used={used_bytes / (1024**3):.2f} GiB "
++                f"total={total_bytes / (1024**3):.2f} GiB"
++            ),
++            flush=True,
++        )
++    except Exception as exc:
++        print(
++            (
++                f"[mainflow_mem_failed] point={point} step={step} pid={os.getpid()} "
++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
++                f"reason={type(exc).__name__}: {exc}"
++            ),
++            flush=True,
++        )
++
++
+ def _with_routing_replay_flag(enabled: bool):
+     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
+ 
+@@ -645,7 +686,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
+     @_with_routing_replay_flag(enabled=True)
+     def compute_log_prob(self, data: TensorDict) -> TensorDict:
++        step = _extract_step(data)
++        _log_mainflow_worker_mem("compute_log_prob_begin", self.rank, step)
+         output = self.actor.infer_batch(data)
++        _log_mainflow_worker_mem("compute_log_prob_end", self.rank, step)
+ 
+         return output.cpu() if output is not None else None
+ 
+@@ -653,7 +697,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @DistProfiler.annotate(color="red", role="actor_update")
+     @_with_routing_replay_flag(enabled=True)
+     def update_actor(self, data: TensorDict) -> TensorDict:
++        step = _extract_step(data)
++        _log_mainflow_worker_mem("update_actor_begin", self.rank, step)
+         output = self.actor.train_mini_batch(data=data)
++        _log_mainflow_worker_mem("update_actor_end", self.rank, step)
+         return output.cpu() if output is not None else None
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+@@ -693,6 +740,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                   trainer/rollout deployments.
+         """
+ 
++        step = "unknown" if global_steps is None else str(global_steps)
++        _log_mainflow_worker_mem("update_weights_begin", self.rank, step)
++
+         # Resolve mode: "auto" falls back to config, explicit values take precedence
+         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+ 
+@@ -703,10 +753,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             return
+ 
+         set_expandable_segments(False)
++        _log_mainflow_worker_mem("rollout_mode_begin", self.rank, step)
+         log_gpu_memory_usage("Before resume weights", logger=logger)
+ 
+         # 1. resume rollout memory (weights were released during sleep)
+         if self.config.rollout.free_cache_engine:
++            _log_mainflow_worker_mem("before_wake_up_weights", self.rank, step)
+             await self.rollout.resume(tags=["weights"])
+         log_gpu_memory_usage("After resume weights", logger=logger)
+ 
