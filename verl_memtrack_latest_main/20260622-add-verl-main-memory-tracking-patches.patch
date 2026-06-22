@@ -1,0 +1,927 @@
+From ab3f70a3c59856f301bdde65ad30d13033b55f70 Mon Sep 17 00:00:00 2001
+From: wangjinyi6 <wangjinyi6@huawei.com>
+Date: Mon, 22 Jun 2026 14:27:11 +0800
+Subject: [PATCH] Add verl main memory tracking patches
+
+---
+ verl_memtrack_latest_main/README.md           | 160 +++++++
+ ...verl-mainflow-memtrack-main-8a694930.patch | 235 ++++++++++
+ ...-update-actor-memtrack-main-8a694930.patch |  75 ++++
+ .../scripts/analyze_mainflow_mem.py           | 414 ++++++++++++++++++
+ 4 files changed, 884 insertions(+)
+ create mode 100644 verl_memtrack_latest_main/README.md
+ create mode 100644 verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch
+ create mode 100644 verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch
+ create mode 100755 verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py
+
+diff --git a/verl_memtrack_latest_main/README.md b/verl_memtrack_latest_main/README.md
+new file mode 100644
+index 0000000..662ec52
+--- /dev/null
++++ b/verl_memtrack_latest_main/README.md
+@@ -0,0 +1,160 @@
++# verl 最新 main 内存增长排查 patch
++
++本目录存放从 `msverl_patch` 迁移并重新适配到当前 `verl main` 的内存排查 patch。
++
++## 适配基线
++
++- 目标仓库：`verl`
++- 目标分支：`main`
++- 目标提交：`8a694930`
++- 适配日期：`2026-06-22`
++
++原始 patch 不能直接应用到该版本，主要原因是最新 `verl` 已经移除了旧的 `verl/workers/megatron_workers.py`，相关 worker 逻辑迁移到了 `verl/workers/engine_workers.py`；同时 trainer 到 worker 的数据传递已经改为 TensorDict 路径，因此 `global_steps` 需要通过 `tu.assign_non_tensor(...)` 传入 worker。
++
++## 文件说明
++
++- `patches/20260622-verl-mainflow-memtrack-main-8a694930.patch`
++  - 全链路排查 patch。
++  - 在 trainer 主流程打印 `[mainflow_probe]`。
++  - 在 worker 关键位置打印 `[mainflow_mem]`。
++  - 用于判断内存增长主要发生在 `compute_log_prob`、`update_actor`、`update_weights` 或 rollout wake up 链路。
++
++- `patches/20260622-verl-update-actor-memtrack-main-8a694930.patch`
++  - 最小排查 patch。
++  - 只在 `update_actor` 前后打印 `[update_actor_mem]`。
++  - 用于减少日志量，只盯 actor 更新阶段。
++
++- `scripts/analyze_mainflow_mem.py`
++  - 解析 `[mainflow_mem]` 日志，按 step/rank 聚合各点位 used/free/total，以及相邻点位的增量。
++  - 只适用于全链路 patch 的 `[mainflow_mem]` 日志。
++
++## 应用方式
++
++两个 patch 是替代方案，建议一次只应用一个。
++
++全链路排查：
++
++```bash
++cd /path/to/verl
++git apply /path/to/blue_to_yellow/verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch
++```
++
++最小 `update_actor` 排查：
++
++```bash
++cd /path/to/verl
++git apply /path/to/blue_to_yellow/verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch
++```
++
++应用前可先检查：
++
++```bash
++git apply --check /path/to/blue_to_yellow/verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch
++git apply --check /path/to/blue_to_yellow/verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch
++```
++
++回滚：
++
++```bash
++git apply -R /path/to/blue_to_yellow/verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch
++git apply -R /path/to/blue_to_yellow/verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch
++```
++
++## 运行环境变量
++
++全链路排查：
++
++```bash
++export RAY_DEDUP_LOGS=0
++export VERL_MAIN_FLOW_MEM=1
++```
++
++最小 `update_actor` 排查：
++
++```bash
++export RAY_DEDUP_LOGS=0
++export VERL_UPDATE_ACTOR_MEM=1
++```
++
++`RAY_DEDUP_LOGS=0` 用于避免 Ray 去重后吞掉重复格式的 worker 日志。
++
++## 日志过滤
++
++全链路：
++
++```bash
++grep -n "\[mainflow_probe\]" train.log
++grep -n "\[mainflow_mem\]" train.log
++grep -n "\[mainflow_mem_failed\]" train.log
++```
++
++最小 `update_actor`：
++
++```bash
++grep -n "\[update_actor_mem\]" train.log
++grep -n "\[update_actor_mem_failed\]" train.log
++```
++
++## 全链路分析脚本
++
++直接打印聚合表：
++
++```bash
++python /path/to/blue_to_yellow/verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py train.log
++```
++
++只看某个 rank：
++
++```bash
++python /path/to/blue_to_yellow/verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py train.log --rank 0
++```
++
++导出 CSV：
++
++```bash
++python /path/to/blue_to_yellow/verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py train.log --csv-prefix /tmp/mainflow
++```
++
++会生成：
++
++- `/tmp/mainflow.points.csv`
++- `/tmp/mainflow.intervals.csv`
++- `/tmp/mainflow.step_points.csv`
++- `/tmp/mainflow.step_intervals.csv`
++
++## 当前点位
++
++trainer 主流程点位：
++
++- `step_begin`
++- `after_gen_sleep_replicas`
++- `after_reward`
++- `before_old_log_prob`
++- `after_old_log_prob`
++- `before_ref_log_prob`
++- `after_ref_log_prob`
++- `before_values`
++- `after_values`
++- `after_adv`
++- `after_update_critic`
++- `before_update_actor`
++- `after_update_actor`
++- `after_save_checkpoint`
++- `before_checkpoint_manager_update_weights`
++- `after_checkpoint_manager_update_weights`
++
++worker 内存点位：
++
++- `compute_log_prob_begin`
++- `compute_log_prob_end`
++- `update_actor_begin`
++- `update_actor_end`
++- `update_weights_begin`
++- `rollout_mode_begin`
++- `before_wake_up_weights`
++
++## 注意事项
++
++- 这些 patch 是排障工具，不建议长期保留在生产训练代码中。
++- 内存读取使用 `torch.npu.mem_get_info()`，如果环境没有 `torch.npu`，日志会打印 `*_failed`，不会中断训练。
++- 如果后续 `verl main` 继续重构 `ray_trainer.py` 或 `engine_workers.py`，需要重新执行 `git apply --check`，不保证自动适配未来提交。
+diff --git a/verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch b/verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch
+new file mode 100644
+index 0000000..8e23a0d
+--- /dev/null
++++ b/verl_memtrack_latest_main/patches/20260622-verl-mainflow-memtrack-main-8a694930.patch
+@@ -0,0 +1,235 @@
++diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
++index 35018ddf..eb1f9606 100644
++--- a/verl/trainer/ppo/ray_trainer.py
+++++ b/verl/trainer/ppo/ray_trainer.py
++@@ -75,6 +75,16 @@ from verl.workers.rollout.llm_server import LLMServerManager
++ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
++ 
++ 
+++def _main_flow_probe_enabled() -> bool:
+++    return os.getenv("VERL_MAIN_FLOW_MEM", "0") == "1"
+++
+++
+++def _emit_main_flow_probe(point: str, step: int) -> None:
+++    if not _main_flow_probe_enabled():
+++        return
+++    print(f"[mainflow_probe] point={point} step={step} pid={os.getpid()}", flush=True)
+++
+++
++ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
++     """Apply KL penalty to the token-level rewards.
++ 
++@@ -1262,6 +1272,7 @@ class RayPPOTrainer:
++             batch_td,
++             calculate_entropy=True,
++             calculate_sum_pi_squared=calculate_sum_pi_squared,
+++            global_steps=self.global_steps,
++             compute_loss=False,
++         )
++         output = self.actor_rollout_wg.compute_log_prob(batch_td)
++@@ -1313,6 +1324,7 @@ class RayPPOTrainer:
++             batch_td,
++             calculate_entropy=calculate_entropy,
++             distillation_use_topk=distillation_use_topk,
+++            global_steps=self.global_steps,
++             global_batch_size=ppo_mini_batch_size,
++             mini_batch_size=ppo_mini_batch_size,
++             epochs=ppo_epochs,
++@@ -1460,6 +1472,7 @@ class RayPPOTrainer:
++ 
++                 is_last_step = self.global_steps >= self.total_training_steps
++                 with marked_timer("step", timing_raw):
+++                    _emit_main_flow_probe("step_begin", self.global_steps)
++                     # generate a batch
++                     with marked_timer("gen", timing_raw, color="red"):
++                         if curr_step_profile:
++@@ -1471,6 +1484,7 @@ class RayPPOTrainer:
++ 
++                         timing_raw.update(combined_gen_output.meta_info["timing"])
++                         combined_gen_output.meta_info.pop("timing", None)
+++                    _emit_main_flow_probe("after_gen_sleep_replicas", self.global_steps)
++ 
++                     gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
++                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
++@@ -1520,6 +1534,7 @@ class RayPPOTrainer:
++ 
++                         # extract reward_tensor and reward_extra_infos_dict for training
++                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+++                    _emit_main_flow_probe("after_reward", self.global_steps)
++ 
++                     # Operating Mode Selection:
++                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
++@@ -1536,6 +1551,7 @@ class RayPPOTrainer:
++                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
++                         )
++                     else:  # Recompute old_log_probs
+++                        _emit_main_flow_probe("before_old_log_prob", self.global_steps)
++                         with marked_timer("old_log_prob", timing_raw, color="blue"):
++                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
++                             entropys = old_log_prob.batch["entropys"]
++@@ -1567,20 +1583,25 @@ class RayPPOTrainer:
++                                 from verl.utils.debug.metrics import calculate_debug_metrics
++ 
++                                 metrics.update(calculate_debug_metrics(batch))
+++                        _emit_main_flow_probe("after_old_log_prob", self.global_steps)
++ 
++                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
++ 
++                     if self.use_reference_policy:
++                         # compute reference log_prob
+++                        _emit_main_flow_probe("before_ref_log_prob", self.global_steps)
++                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
++                             ref_log_prob = self._compute_ref_log_prob(batch)
++                             batch = batch.union(ref_log_prob)
+++                        _emit_main_flow_probe("after_ref_log_prob", self.global_steps)
++ 
++                     # compute values
++                     if self.use_critic:
+++                        _emit_main_flow_probe("before_values", self.global_steps)
++                         with marked_timer("values", timing_raw, color="cyan"):
++                             values = self._compute_values(batch)
++                             batch = batch.union(values)
+++                        _emit_main_flow_probe("after_values", self.global_steps)
++ 
++                     with marked_timer("adv", timing_raw, color="brown"):
++                         # we combine with rule-based rm
++@@ -1628,6 +1649,7 @@ class RayPPOTrainer:
++                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++                             config=self.config.algorithm,
++                         )
+++                    _emit_main_flow_probe("after_adv", self.global_steps)
++ 
++                     # update critic
++                     if self.use_critic:
++@@ -1635,15 +1657,20 @@ class RayPPOTrainer:
++                             critic_output = self._update_critic(batch)
++                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
++                         metrics.update(critic_output_metrics)
+++                        _emit_main_flow_probe("after_update_critic", self.global_steps)
++ 
++                     # implement critic warmup
++                     if self.config.trainer.critic_warmup > self.global_steps:
++                         # Still in critic warmup, only update weights to wake up rollout replicas.
+++                        _emit_main_flow_probe("before_checkpoint_manager_update_weights", self.global_steps)
++                         self.checkpoint_manager.update_weights(self.global_steps)
+++                        _emit_main_flow_probe("after_checkpoint_manager_update_weights", self.global_steps)
++                     else:
++                         # update actor
+++                        _emit_main_flow_probe("before_update_actor", self.global_steps)
++                         with marked_timer("update_actor", timing_raw, color="red"):
++                             actor_output = self._update_actor(batch)
+++                        _emit_main_flow_probe("after_update_actor", self.global_steps)
++ 
++                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
++                         esi_close_to_expiration = should_save_ckpt_esi(
++@@ -1666,10 +1693,13 @@ class RayPPOTrainer:
++                                 print("Force saving checkpoint: ESI instance expiration approaching.")
++                             with marked_timer("save_checkpoint", timing_raw, color="green"):
++                                 self._save_checkpoint()
+++                            _emit_main_flow_probe("after_save_checkpoint", self.global_steps)
++ 
++                         # update weights from trainer to rollout
+++                        _emit_main_flow_probe("before_checkpoint_manager_update_weights", self.global_steps)
++                         with marked_timer("update_weights", timing_raw, color="red"):
++                             self.checkpoint_manager.update_weights(self.global_steps)
+++                        _emit_main_flow_probe("after_checkpoint_manager_update_weights", self.global_steps)
++ 
++                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
++                         metrics.update(actor_output_metrics)
++diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
++index c65b99e4..6f185309 100644
++--- a/verl/workers/engine_workers.py
+++++ b/verl/workers/engine_workers.py
++@@ -58,6 +58,47 @@ logger = logging.getLogger(__file__)
++ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
++ 
++ 
+++def _main_flow_mem_enabled() -> bool:
+++    return os.getenv("VERL_MAIN_FLOW_MEM", "0") == "1"
+++
+++
+++def _extract_step(data: TensorDict | None) -> str:
+++    if data is None:
+++        return "unknown"
+++    step = tu.get(data, "global_steps", default=None)
+++    return "unknown" if step is None else str(step)
+++
+++
+++def _log_mainflow_worker_mem(point: str, rank: int, step: str) -> None:
+++    if not _main_flow_mem_enabled():
+++        return
+++    try:
+++        npu = getattr(torch, "npu", None)
+++        if npu is None:
+++            raise RuntimeError("torch.npu is unavailable")
+++        free_bytes, total_bytes = npu.mem_get_info()
+++        used_bytes = total_bytes - free_bytes
+++        print(
+++            (
+++                f"[mainflow_mem] point={point} step={step} pid={os.getpid()} "
+++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
+++                f"free={free_bytes / (1024**3):.2f} GiB "
+++                f"used={used_bytes / (1024**3):.2f} GiB "
+++                f"total={total_bytes / (1024**3):.2f} GiB"
+++            ),
+++            flush=True,
+++        )
+++    except Exception as exc:
+++        print(
+++            (
+++                f"[mainflow_mem_failed] point={point} step={step} pid={os.getpid()} "
+++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
+++                f"reason={type(exc).__name__}: {exc}"
+++            ),
+++            flush=True,
+++        )
+++
+++
++ def _with_routing_replay_flag(enabled: bool):
++     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
++ 
++@@ -645,7 +686,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
++     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
++     @_with_routing_replay_flag(enabled=True)
++     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+++        step = _extract_step(data)
+++        _log_mainflow_worker_mem("compute_log_prob_begin", self.rank, step)
++         output = self.actor.infer_batch(data)
+++        _log_mainflow_worker_mem("compute_log_prob_end", self.rank, step)
++ 
++         return output.cpu() if output is not None else None
++ 
++@@ -653,7 +697,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
++     @DistProfiler.annotate(color="red", role="actor_update")
++     @_with_routing_replay_flag(enabled=True)
++     def update_actor(self, data: TensorDict) -> TensorDict:
+++        step = _extract_step(data)
+++        _log_mainflow_worker_mem("update_actor_begin", self.rank, step)
++         output = self.actor.train_mini_batch(data=data)
+++        _log_mainflow_worker_mem("update_actor_end", self.rank, step)
++         return output.cpu() if output is not None else None
++ 
++     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++@@ -693,6 +740,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
++                   trainer/rollout deployments.
++         """
++ 
+++        step = "unknown" if global_steps is None else str(global_steps)
+++        _log_mainflow_worker_mem("update_weights_begin", self.rank, step)
+++
++         # Resolve mode: "auto" falls back to config, explicit values take precedence
++         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
++ 
++@@ -703,10 +753,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
++             return
++ 
++         set_expandable_segments(False)
+++        _log_mainflow_worker_mem("rollout_mode_begin", self.rank, step)
++         log_gpu_memory_usage("Before resume weights", logger=logger)
++ 
++         # 1. resume rollout memory (weights were released during sleep)
++         if self.config.rollout.free_cache_engine:
+++            _log_mainflow_worker_mem("before_wake_up_weights", self.rank, step)
++             await self.rollout.resume(tags=["weights"])
++         log_gpu_memory_usage("After resume weights", logger=logger)
++ 
+diff --git a/verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch b/verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch
+new file mode 100644
+index 0000000..3c70a16
+--- /dev/null
++++ b/verl_memtrack_latest_main/patches/20260622-verl-update-actor-memtrack-main-8a694930.patch
+@@ -0,0 +1,75 @@
++diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
++index 35018ddf..7b53b3d1 100644
++--- a/verl/trainer/ppo/ray_trainer.py
+++++ b/verl/trainer/ppo/ray_trainer.py
++@@ -1313,6 +1313,7 @@ class RayPPOTrainer:
++             batch_td,
++             calculate_entropy=calculate_entropy,
++             distillation_use_topk=distillation_use_topk,
+++            global_steps=self.global_steps,
++             global_batch_size=ppo_mini_batch_size,
++             mini_batch_size=ppo_mini_batch_size,
++             epochs=ppo_epochs,
++diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
++index c65b99e4..180a207a 100644
++--- a/verl/workers/engine_workers.py
+++++ b/verl/workers/engine_workers.py
++@@ -58,6 +58,47 @@ logger = logging.getLogger(__file__)
++ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
++ 
++ 
+++def _update_actor_mem_enabled() -> bool:
+++    return os.getenv("VERL_UPDATE_ACTOR_MEM", "0") == "1"
+++
+++
+++def _extract_step(data: TensorDict | None) -> str:
+++    if data is None:
+++        return "unknown"
+++    step = tu.get(data, "global_steps", default=None)
+++    return "unknown" if step is None else str(step)
+++
+++
+++def _log_update_actor_mem(point: str, rank: int, step: str) -> None:
+++    if not _update_actor_mem_enabled():
+++        return
+++    try:
+++        npu = getattr(torch, "npu", None)
+++        if npu is None:
+++            raise RuntimeError("torch.npu is unavailable")
+++        free_bytes, total_bytes = npu.mem_get_info()
+++        used_bytes = total_bytes - free_bytes
+++        print(
+++            (
+++                f"[update_actor_mem] point={point} step={step} pid={os.getpid()} "
+++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
+++                f"free={free_bytes / (1024**3):.2f} GiB "
+++                f"used={used_bytes / (1024**3):.2f} GiB "
+++                f"total={total_bytes / (1024**3):.2f} GiB"
+++            ),
+++            flush=True,
+++        )
+++    except Exception as exc:
+++        print(
+++            (
+++                f"[update_actor_mem_failed] point={point} step={step} pid={os.getpid()} "
+++                f"rank={rank} local_rank={os.getenv('LOCAL_RANK', 'unknown')} "
+++                f"reason={type(exc).__name__}: {exc}"
+++            ),
+++            flush=True,
+++        )
+++
+++
++ def _with_routing_replay_flag(enabled: bool):
++     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
++ 
++@@ -653,7 +694,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
++     @DistProfiler.annotate(color="red", role="actor_update")
++     @_with_routing_replay_flag(enabled=True)
++     def update_actor(self, data: TensorDict) -> TensorDict:
+++        step = _extract_step(data)
+++        _log_update_actor_mem("update_actor_begin", self.rank, step)
++         output = self.actor.train_mini_batch(data=data)
+++        _log_update_actor_mem("update_actor_end", self.rank, step)
++         return output.cpu() if output is not None else None
++ 
++     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+diff --git a/verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py b/verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py
+new file mode 100755
+index 0000000..855b3c6
+--- /dev/null
++++ b/verl_memtrack_latest_main/scripts/analyze_mainflow_mem.py
+@@ -0,0 +1,414 @@
++#!/usr/bin/env python3
++"""Analyze [mainflow_mem] logs emitted by verl_main_flow_memtrack.diff.
++
++Example:
++    python scripts/analyze_mainflow_mem.py train.log
++    python scripts/analyze_mainflow_mem.py train.log --rank 0 --csv-prefix out/mainflow
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import re
++from collections import defaultdict
++from dataclasses import dataclass
++from pathlib import Path
++
++
++LINE_RE = re.compile(
++    r"\[mainflow_mem\]\s+"
++    r"point=(?P<point>\S+)\s+"
++    r"step=(?P<step>\d+)\s+"
++    r"pid=(?P<pid>\d+)\s+"
++    r"rank=(?P<rank>\S+)\s+"
++    r"local_rank=(?P<local_rank>\S+)\s+"
++    r"free=(?P<free>[0-9.]+)\s+GiB\s+"
++    r"used=(?P<used>[0-9.]+)\s+GiB\s+"
++    r"total=(?P<total>[0-9.]+)\s+GiB"
++    r"(?:\s+delta_prev=(?P<delta_prev>-?[0-9.]+)\s+GiB\s+delta_step=(?P<delta_step>-?[0-9.]+)\s+GiB)?"
++)
++
++
++KNOWN_POINT_ORDER = [
++    "compute_log_prob_begin",
++    "compute_log_prob_end",
++    "update_actor_begin",
++    "update_actor_end",
++    "update_weights_begin",
++    "rollout_mode_begin",
++    "before_wake_up_weights",
++]
++
++
++@dataclass
++class Record:
++    step: int
++    rank: str
++    local_rank: str
++    pid: int
++    point: str
++    free: float
++    used: float
++    total: float
++    delta_prev: float | None
++    delta_step: float | None
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Analyze [mainflow_mem] logs and summarize point usage and interval deltas by step/rank."
++    )
++    parser.add_argument("logfile", type=Path, help="Path to the training log file.")
++    parser.add_argument("--rank", help="Only include one rank, e.g. 0.")
++    parser.add_argument("--local-rank", help="Only include one local_rank, e.g. 0.")
++    parser.add_argument("--pid", type=int, help="Only include one pid.")
++    parser.add_argument(
++        "--csv-prefix",
++        type=Path,
++        help="If set, write '<prefix>.points.csv' and '<prefix>.intervals.csv'.",
++    )
++    parser.add_argument(
++        "--show-all-points",
++        action="store_true",
++        help="Print every discovered point instead of only the known ordered points first.",
++    )
++    return parser.parse_args()
++
++
++def parse_records(logfile: Path) -> list[Record]:
++    records: list[Record] = []
++    with logfile.open("r", encoding="utf-8", errors="replace") as fh:
++        for line in fh:
++            match = LINE_RE.search(line)
++            if not match:
++                continue
++            groups = match.groupdict()
++            records.append(
++                Record(
++                    step=int(groups["step"]),
++                    rank=groups["rank"],
++                    local_rank=groups["local_rank"],
++                    pid=int(groups["pid"]),
++                    point=groups["point"],
++                    free=float(groups["free"]),
++                    used=float(groups["used"]),
++                    total=float(groups["total"]),
++                    delta_prev=float(groups["delta_prev"]) if groups["delta_prev"] is not None else None,
++                    delta_step=float(groups["delta_step"]) if groups["delta_step"] is not None else None,
++                )
++            )
++    return records
++
++
++def point_order(records: list[Record], show_all_points: bool) -> list[str]:
++    seen = {record.point for record in records}
++    ordered = [point for point in KNOWN_POINT_ORDER if point in seen]
++    if show_all_points:
++        extras = sorted(seen - set(ordered))
++        ordered.extend(extras)
++    return ordered
++
++
++def average(values: list[float]) -> float:
++    return sum(values) / len(values) if values else 0.0
++
++
++def aggregate_points(records: list[Record]) -> dict[tuple[int, str, str], dict[str, dict[str, float]]]:
++    grouped: dict[tuple[int, str, str], dict[str, list[Record]]] = defaultdict(lambda: defaultdict(list))
++    for record in records:
++        grouped[(record.step, record.rank, record.local_rank)][record.point].append(record)
++
++    result: dict[tuple[int, str, str], dict[str, dict[str, float]]] = {}
++    for key, point_map in grouped.items():
++        result[key] = {}
++        for point, items in point_map.items():
++            result[key][point] = {
++                "avg_used": average([item.used for item in items]),
++                "avg_free": average([item.free for item in items]),
++                "avg_total": average([item.total for item in items]),
++                "avg_delta_prev": average([item.delta_prev for item in items if item.delta_prev is not None]),
++                "avg_delta_step": average([item.delta_step for item in items if item.delta_step is not None]),
++                "samples": float(len(items)),
++            }
++    return result
++
++
++def aggregate_points_by_step(
++    aggregated: dict[tuple[int, str, str], dict[str, dict[str, float]]],
++) -> dict[int, dict[str, dict[str, float]]]:
++    by_step_raw: dict[int, dict[str, dict[str, list[float]]]] = defaultdict(
++        lambda: defaultdict(lambda: defaultdict(list))
++    )
++    for (step, _rank, _local_rank), point_map in aggregated.items():
++        for point, stats in point_map.items():
++            by_step_raw[step][point]["avg_used"].append(stats["avg_used"])
++            by_step_raw[step][point]["avg_free"].append(stats["avg_free"])
++            by_step_raw[step][point]["avg_total"].append(stats["avg_total"])
++            by_step_raw[step][point]["samples"].append(stats["samples"])
++
++    by_step: dict[int, dict[str, dict[str, float]]] = {}
++    for step, point_map in by_step_raw.items():
++        by_step[step] = {}
++        for point, stats in point_map.items():
++            by_step[step][point] = {
++                "avg_used": average(stats["avg_used"]),
++                "avg_free": average(stats["avg_free"]),
++                "avg_total": average(stats["avg_total"]),
++                "contributors": float(len(stats["avg_used"])),
++                "samples": sum(stats["samples"]),
++            }
++    return by_step
++
++
++def compute_intervals(
++    aggregated: dict[tuple[int, str, str], dict[str, dict[str, float]]],
++    ordered_points: list[str],
++) -> list[dict[str, object]]:
++    rows: list[dict[str, object]] = []
++    for (step, rank, local_rank), point_map in sorted(aggregated.items()):
++        prev_point = None
++        prev_used = None
++        for point in ordered_points:
++            if point not in point_map:
++                continue
++            used = point_map[point]["avg_used"]
++            if prev_point is not None and prev_used is not None:
++                rows.append(
++                    {
++                        "step": step,
++                        "rank": rank,
++                        "local_rank": local_rank,
++                        "interval": f"{prev_point}->{point}",
++                        "start_point": prev_point,
++                        "end_point": point,
++                        "start_used_gib": prev_used,
++                        "end_used_gib": used,
++                        "delta_interval_gib": used - prev_used,
++                    }
++                )
++            prev_point = point
++            prev_used = used
++    return rows
++
++
++def aggregate_intervals_by_step(interval_rows: list[dict[str, object]]) -> dict[int, dict[str, float]]:
++    raw: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
++    for row in interval_rows:
++        raw[int(row["step"])][str(row["interval"])].append(float(row["delta_interval_gib"]))
++
++    result: dict[int, dict[str, float]] = {}
++    for step, interval_map in raw.items():
++        result[step] = {}
++        for interval, values in interval_map.items():
++            result[step][interval] = average(values)
++    return result
++
++
++def print_points_table(
++    aggregated: dict[tuple[int, str, str], dict[str, dict[str, float]]],
++    ordered_points: list[str],
++) -> None:
++    print("== Point Avg Used (GiB) ==")
++    header = ["step", "rank", "local_rank"] + ordered_points
++    print("\t".join(header))
++    for (step, rank, local_rank), point_map in sorted(aggregated.items()):
++        row = [str(step), rank, local_rank]
++        for point in ordered_points:
++            value = point_map.get(point, {}).get("avg_used")
++            row.append("" if value is None else f"{value:.2f}")
++        print("\t".join(row))
++    print()
++
++
++def print_step_points_table(
++    aggregated_by_step: dict[int, dict[str, dict[str, float]]],
++    ordered_points: list[str],
++) -> None:
++    print("== Step Avg Used Across All Ranks (GiB) ==")
++    header = ["step"] + ordered_points
++    print("\t".join(header))
++    for step in sorted(aggregated_by_step):
++        point_map = aggregated_by_step[step]
++        row = [str(step)]
++        for point in ordered_points:
++            value = point_map.get(point, {}).get("avg_used")
++            row.append("" if value is None else f"{value:.2f}")
++        print("\t".join(row))
++    print()
++
++
++def print_interval_table(interval_rows: list[dict[str, object]], ordered_points: list[str]) -> None:
++    print("== Interval Avg Delta (GiB) ==")
++    interval_order = []
++    for idx in range(1, len(ordered_points)):
++        interval_order.append(f"{ordered_points[idx - 1]}->{ordered_points[idx]}")
++    by_key: dict[tuple[int, str, str], dict[str, float]] = defaultdict(dict)
++    for row in interval_rows:
++        by_key[(int(row["step"]), str(row["rank"]), str(row["local_rank"]))][str(row["interval"])] = float(
++            row["delta_interval_gib"]
++        )
++
++    header = ["step", "rank", "local_rank"] + interval_order
++    print("\t".join(header))
++    for key in sorted(by_key):
++        step, rank, local_rank = key
++        row = [str(step), rank, local_rank]
++        for interval in interval_order:
++            value = by_key[key].get(interval)
++            row.append("" if value is None else f"{value:.2f}")
++        print("\t".join(row))
++    print()
++
++
++def print_step_interval_table(
++    intervals_by_step: dict[int, dict[str, float]],
++    ordered_points: list[str],
++) -> None:
++    print("== Step Avg Delta Across All Ranks (GiB) ==")
++    interval_order = [f"{ordered_points[idx - 1]}->{ordered_points[idx]}" for idx in range(1, len(ordered_points))]
++    header = ["step"] + interval_order
++    print("\t".join(header))
++    for step in sorted(intervals_by_step):
++        interval_map = intervals_by_step[step]
++        row = [str(step)]
++        for interval in interval_order:
++            value = interval_map.get(interval)
++            row.append("" if value is None else f"{value:.2f}")
++        print("\t".join(row))
++    print()
++
++
++def write_csvs(
++    prefix: Path,
++    aggregated: dict[tuple[int, str, str], dict[str, dict[str, float]]],
++    interval_rows: list[dict[str, object]],
++) -> None:
++    prefix.parent.mkdir(parents=True, exist_ok=True)
++    points_path = prefix.with_suffix(".points.csv")
++    intervals_path = prefix.with_suffix(".intervals.csv")
++    step_points_path = prefix.with_suffix(".step_points.csv")
++    step_intervals_path = prefix.with_suffix(".step_intervals.csv")
++
++    with points_path.open("w", newline="", encoding="utf-8") as fh:
++        writer = csv.writer(fh)
++        writer.writerow(
++            [
++                "step",
++                "rank",
++                "local_rank",
++                "point",
++                "avg_used_gib",
++                "avg_free_gib",
++                "avg_total_gib",
++                "avg_delta_prev_gib",
++                "avg_delta_step_gib",
++                "samples",
++            ]
++        )
++        for (step, rank, local_rank), point_map in sorted(aggregated.items()):
++            for point, stats in sorted(point_map.items()):
++                writer.writerow(
++                    [
++                        step,
++                        rank,
++                        local_rank,
++                        point,
++                        f"{stats['avg_used']:.6f}",
++                        f"{stats['avg_free']:.6f}",
++                        f"{stats['avg_total']:.6f}",
++                        f"{stats['avg_delta_prev']:.6f}",
++                        f"{stats['avg_delta_step']:.6f}",
++                        int(stats["samples"]),
++                    ]
++                )
++
++    with intervals_path.open("w", newline="", encoding="utf-8") as fh:
++        writer = csv.DictWriter(
++            fh,
++            fieldnames=[
++                "step",
++                "rank",
++                "local_rank",
++                "interval",
++                "start_point",
++                "end_point",
++                "start_used_gib",
++                "end_used_gib",
++                "delta_interval_gib",
++            ],
++        )
++        writer.writeheader()
++        for row in interval_rows:
++            out = dict(row)
++            out["start_used_gib"] = f"{float(out['start_used_gib']):.6f}"
++            out["end_used_gib"] = f"{float(out['end_used_gib']):.6f}"
++            out["delta_interval_gib"] = f"{float(out['delta_interval_gib']):.6f}"
++            writer.writerow(out)
++
++    aggregated_by_step = aggregate_points_by_step(aggregated)
++    intervals_by_step = aggregate_intervals_by_step(interval_rows)
++
++    with step_points_path.open("w", newline="", encoding="utf-8") as fh:
++        writer = csv.writer(fh)
++        writer.writerow(["step", "point", "avg_used_gib", "avg_free_gib", "avg_total_gib", "contributors", "samples"])
++        for step, point_map in sorted(aggregated_by_step.items()):
++            for point, stats in sorted(point_map.items()):
++                writer.writerow(
++                    [
++                        step,
++                        point,
++                        f"{stats['avg_used']:.6f}",
++                        f"{stats['avg_free']:.6f}",
++                        f"{stats['avg_total']:.6f}",
++                        int(stats["contributors"]),
++                        int(stats["samples"]),
++                    ]
++                )
++
++    with step_intervals_path.open("w", newline="", encoding="utf-8") as fh:
++        writer = csv.writer(fh)
++        writer.writerow(["step", "interval", "avg_delta_interval_gib"])
++        for step, interval_map in sorted(intervals_by_step.items()):
++            for interval, value in sorted(interval_map.items()):
++                writer.writerow([step, interval, f"{value:.6f}"])
++
++    print(f"Wrote {points_path}")
++    print(f"Wrote {intervals_path}")
++    print(f"Wrote {step_points_path}")
++    print(f"Wrote {step_intervals_path}")
++
++
++def main() -> int:
++    args = parse_args()
++    records = parse_records(args.logfile)
++    if args.rank is not None:
++        records = [record for record in records if record.rank == args.rank]
++    if args.local_rank is not None:
++        records = [record for record in records if record.local_rank == args.local_rank]
++    if args.pid is not None:
++        records = [record for record in records if record.pid == args.pid]
++
++    if not records:
++        print("No [mainflow_mem] records found with the given filters.")
++        return 1
++
++    ordered_points = point_order(records, args.show_all_points)
++    aggregated = aggregate_points(records)
++    interval_rows = compute_intervals(aggregated, ordered_points)
++    aggregated_by_step = aggregate_points_by_step(aggregated)
++    intervals_by_step = aggregate_intervals_by_step(interval_rows)
++
++    print_step_points_table(aggregated_by_step, ordered_points)
++    print_step_interval_table(intervals_by_step, ordered_points)
++    print_points_table(aggregated, ordered_points)
++    print_interval_table(interval_rows, ordered_points)
++
++    if args.csv_prefix is not None:
++        write_csvs(args.csv_prefix, aggregated, interval_rows)
++
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+-- 
+2.50.1 (Apple Git-155)
+
