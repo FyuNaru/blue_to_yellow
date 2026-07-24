@@ -1,5 +1,12 @@
 # blue_to_yellow
 
+## SGL DeepEP training feasibility
+
+See [SGL DeepEP 用于 MindSpeed MoE 训练的阶段性调研报告](./reports/20260724-sgl-deepep-mindspeed-training-feasibility.md)
+for the DeepEP normal/fused call flow, current MindSpeed MoE path, backward
+adaptation gaps, candidate integration options, alignment questions, and phased
+validation plan.
+
 ## MoE learning closures
 
 See [moe_learning_closures](./moe_learning_closures) for four small PyTorch examples that can run on NPU with `torch_npu`:
