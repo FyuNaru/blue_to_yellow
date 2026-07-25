@@ -2,6 +2,7 @@
 
 > - 任务提出时间：2026-07-20
 > - 报告时间：2026-07-24
+> - 最近更新：2026-07-25，补充 normal dispatch 完整调用栈、参数语义和迁移接口
 > - 当前阶段：源码调研与方案对齐，尚未完成 NPU 实机验证
 
 ## 1. 摘要
@@ -548,6 +549,11 @@ Backward 不对齐：不进入完整训练和性能优化。
 - 建立 MoE、EP、dispatch/combine、normal/fused 的概念边界。
 - 确认 DeepEP 可单独打包为 `deep_ep.whl`，不需要引入完整 SGLang。
 - 追踪 normal dispatch 的 Python → strategy → C++ → AscendC 调用链。
+- 完成 normal dispatch 的逐层接口审计，确认其由 `DispatchLayout`、`NotifyDispatch` 和
+  `CamMoeDispatchNormal` 三个 NPU 算子组成，并确认 layout 与 dispatch 之间存在 C++ `Buffer`
+  内部状态依赖。
+- 确认当前 intranode normal 路径中的 `recv_topk_idx`、`recv_topk_weights` 只分配未写入，
+  `handle` 复用尚未实现，部分 event/alignment/cache 参数暂未生效。
 - 追踪 normal combine 和 fused Deep MoE 调用链。
 - 确认当前代码没有训练 autograd/backward。
 - 确认当前 default normal event 接口不足以直接认定训练 overlap 可用。
@@ -575,7 +581,600 @@ Backward 不对齐：不进入完整训练和性能优化。
 
 如果以上边界能够对齐，下一阶段可以立即输出最小 Forward POC 的测试设计和接口映射表。
 
-## 附录：关键源码位置
+## 附录 A：Normal dispatch 完整调用栈与迁移接口
+
+### A.1 结论
+
+训练侧需要迁移的 `dispatch` 不是单个 `CamMoeDispatchNormal` 算子，而是一条由三个 NPU
+自定义算子组成的流水线：
+
+```text
+get_dispatch_layout
+  └─ DispatchLayout：分析 Top-K 路由，生成 rank/expert 布局和发送索引
+
+dispatch
+  ├─ NotifyDispatch：各 EP rank 交换计数和 offset 元数据
+  └─ CamMoeDispatchNormal：按 Expert 重排 token，并完成 EP 通信
+```
+
+因此兼容 DeepEP 的最小公开接口至少包括：
+
+```python
+buffer.get_dispatch_layout(...)
+buffer.dispatch(...)
+```
+
+不能只抽取或封装 `CamMoeDispatchNormal`。当前源码基线为
+`sgl-kernel-npu main@d66174769bf36b6cd1b8247ced156ce94287bcb8`，以下重点描述
+`DEEP_USE_MODE=default` 下用于 Prefill/训练候选的 normal 路径。
+
+### A.2 初学者示例：dispatch 的输入输出
+
+假设 EP 并行度为 2，共有 4 个 Expert：
+
+```text
+rank 0：Expert 0、Expert 1
+rank 1：Expert 2、Expert 3
+```
+
+rank 0 当前有三个 token，每个 token 选择两个 Expert：
+
+```text
+token    Top-K Expert    Router 权重
+x0       [0, 2]          [0.60, 0.40]
+x1       [3, 2]          [0.70, 0.30]
+x2       [1, 0]          [0.55, 0.45]
+```
+
+layout 阶段计算出的逻辑结果为：
+
+```text
+num_tokens_per_rank   = [2, 2]
+num_tokens_per_expert = [2, 1, 2, 1]
+
+is_token_in_rank =
+[
+  [1, 1],  # x0 同时去 rank 0 和 rank 1
+  [0, 1],  # x1 只去 rank 1
+  [1, 0],  # x2 只去 rank 0
+]
+```
+
+dispatch 后的数据布局为：
+
+```text
+rank 0:
+  Expert 0: x0, x2
+  Expert 1: x2
+
+rank 1:
+  Expert 2: x0, x1
+  Expert 3: x1
+```
+
+因此 `recv_x` 不是简单的原始 token 列表，而是按本地 Expert 连续排列、可直接交给
+GMM 的 Expert 输入。一个 token 如果命中同一 rank 上的多个 Expert，在当前实现中仍会按
+Expert 路径重复展开。
+
+### A.3 Buffer 初始化调用栈
+
+```text
+import deep_ep
+  └─ python/deep_ep/deep_ep/__init__.py
+       设置 ASCEND_CUSTOM_OPP_PATH 和 op_api 动态库路径
+
+deep_ep.Buffer(ep_group)
+  └─ python/deep_ep/deep_ep/buffer.py::Buffer.__init__
+       ├─ 读取 EP rank/world size
+       ├─ 从 torch_npu HCCL backend 获取通信域名称
+       ├─ 创建 deep_ep_cpp.Buffer
+       └─ 根据 DEEP_USE_MODE 选择 normal/low-latency strategy
+
+deep_ep_cpp.Buffer(...)
+  └─ csrc/deepep/pybind_extension.cpp
+       └─ csrc/deepep/deep_ep.cpp::Buffer::Buffer
+```
+
+默认 `DEEP_USE_MODE=default` 选择 `DefaultNormalCommStrategy`，即本附录分析的自定义算子
+路径。`DEEP_USE_MODE=alltoall` 会改走 `torch.distributed` AllToAll 策略，不属于本次
+算子迁移对象。
+
+C++ `Buffer` 除保存 rank、world size、HCCL 通信域和长序列配置外，还保存：
+
+```text
+notify_send_data
+send_token_idx_small
+```
+
+这两个张量由 `get_dispatch_layout()` 生成，后续 `dispatch()` 直接从同一个 C++ `Buffer`
+对象读取。这说明当前 `dispatch` 不是无状态纯函数，必须先调用 layout，且两次调用必须使用
+同一个 `Buffer` 实例。
+
+### A.4 get_dispatch_layout 完整调用栈
+
+```text
+用户
+└─ deep_ep.Buffer.get_dispatch_layout()
+   # python/deep_ep/deep_ep/buffer.py
+   └─ DefaultNormalCommStrategy.get_dispatch_layout()
+      # python/deep_ep/deep_ep/strategies/normal_strategy.py
+      └─ deep_ep_cpp.Buffer.get_dispatch_layout()
+         # csrc/deepep/pybind_extension.cpp
+         └─ Buffer::get_dispatch_layout()
+            # csrc/deepep/deep_ep.cpp
+            └─ EXEC_NPU_CMD(aclnnDispatchLayout)
+               ├─ ops/op_host/op_api/aclnn_dispatch_layout.{h,cpp}
+               ├─ ops/op_host/dispatch_layout.cpp
+               ├─ ops/op_host/dispatch_layout_tiling.cc
+               └─ ops/op_kernel/dispatch_layout*
+```
+
+公开接口为：
+
+```python
+def get_dispatch_layout(
+    self,
+    topk_idx: torch.Tensor,
+    num_experts: int,
+    previous_event: Optional[EventOverlap] = None,
+    async_finish: bool = False,
+    allocate_on_comm_stream: bool = False,
+)
+```
+
+参数语义：
+
+| 参数 | 形状/类型 | 含义 |
+| --- | --- | --- |
+| `topk_idx` | `[N, K]`, `int64` | 每个 token 选择的全局 Expert 编号，`-1` 表示该路径被丢弃 |
+| `num_experts` | Python `int` | EP 通信域内的全局 Expert 总数 |
+| `previous_event` | `EventOverlap` 或 `None` | 当前操作需要等待的前置事件 |
+| `async_finish` | `bool` | 是否允许当前计算流不等待通信完成 |
+| `allocate_on_comm_stream` | `bool` | 输出张量是否在通信流上分配和管理 |
+
+返回值：
+
+| 返回值 | 形状/类型 | 含义 |
+| --- | --- | --- |
+| `num_tokens_per_rank` | `[P]`, `int32` | 当前 rank 需要向每个目标 EP rank 发送的去重 token 数 |
+| `num_tokens_per_rdma_rank` | 可选张量 | 跨节点分层通信的 token 数；intranode 返回 `None` |
+| `num_tokens_per_expert` | `[round * E]`, `int32` | 每轮中每个全局 Expert 接收的路径数 |
+| `is_token_in_rank` | `[N, P]`, `int32` | 每个 token 是否需要发送到某个 EP rank |
+| `event` | `EventOverlap` | 异步完成事件；当前 default normal 实现实际为空 |
+
+`DispatchLayout` NPU 算子还额外输出：
+
+| 内部输出 | 作用 |
+| --- | --- |
+| `notify_send_data` | 保存每 Expert/服务器的计数、顺序和 offset，供 NotifyDispatch 使用 |
+| `send_token_idx_small` | 保存每条 Top-K 路径在发送缓冲区中的相对位置 |
+
+这两个内部输出没有通过 Python API 返回，而是写入 C++ `Buffer` 成员。
+
+### A.5 dispatch 完整调用栈
+
+对于 A3/A5 的 default normal 路径：
+
+```text
+用户
+└─ deep_ep.Buffer.dispatch()
+   # python/deep_ep/deep_ep/buffer.py
+   └─ DefaultNormalCommStrategy.dispatch()
+      # python/deep_ep/deep_ep/strategies/normal_strategy.py
+      └─ DefaultNormalCommStrategy._intranode_dispatch()
+         └─ deep_ep_cpp.Buffer.intranode_dispatch()
+            # csrc/deepep/pybind_extension.cpp
+            └─ Buffer::intranode_dispatch()
+               # csrc/deepep/deep_ep.cpp
+               ├─ EXEC_NPU_CMD(aclnnNotifyDispatch)
+               │  ├─ ops/op_host/op_api/aclnn_notify_dispatch.{h,cpp}
+               │  ├─ ops/op_host/notify_dispatch.cpp
+               │  ├─ ops/op_host/notify_dispatch_tiling.cc
+               │  └─ ops/op_kernel/notify_dispatch*
+               └─ EXEC_NPU_CMD(aclnnCamMoeDispatchNormal)
+                  ├─ ops/op_host/op_api/aclnn_cam_moe_dispatch_normal.{h,cpp}
+                  ├─ ops/op_host/cam_moe_dispatch_normal.cpp
+                  ├─ ops/op_host/cam_moe_dispatch_normal_tiling.cc
+                  └─ ops/op_kernel/cam_moe_dispatch_normal*
+```
+
+`DefaultNormalCommStrategy.dispatch()` 会根据
+`runtime.get_num_rdma_ranks()` 选择 intranode 或 internode。Ascend 910B 在 EP rank
+超过节点内范围时会走 A2/RDMA 路径；本节分析的是 A3/A5 使用的
+`_intranode_dispatch()`。
+
+公开接口为：
+
+```python
+def dispatch(
+    self,
+    x,
+    handle=None,
+    num_tokens_per_rank=None,
+    num_tokens_per_rdma_rank=None,
+    is_token_in_rank=None,
+    num_tokens_per_expert=None,
+    topk_idx=None,
+    topk_weights=None,
+    expert_alignment=1,
+    num_worst_tokens=0,
+    config=None,
+    previous_event=None,
+    async_finish=False,
+    allocate_on_comm_stream=False,
+    dispatch_wait_recv_cost_stats=None,
+    quant_mode=None,
+)
+```
+
+参数语义和当前实现状态：
+
+| 参数 | 形状/类型 | 含义 | 当前 default intranode 状态 |
+| --- | --- | --- | --- |
+| `x` | `[N,H]` BF16，或量化 tuple | 原始 token hidden state | BF16 可作为训练首版 |
+| `handle` | 可选 tuple | 希望复用已有通信布局 | 非空会直接抛 `NotImplementedError` |
+| `num_tokens_per_rank` | `[P]` int32 | 各目标 rank 的 token 数 | 必须由 layout 提供 |
+| `num_tokens_per_rdma_rank` | 可选张量 | 跨节点 RDMA 计数 | intranode 不使用 |
+| `is_token_in_rank` | `[N,P]` | token 是否去某 rank | Python 要求非空，当前 C++ intranode 未实际读取 |
+| `num_tokens_per_expert` | `[round*E]` int32 | 每个 Expert 的路径数 | 必须由 layout 提供 |
+| `topk_idx` | `[N,K]` int64 | 全局 Expert 编号 | C++ 转成 int32 `expert_ids` |
+| `topk_weights` | `[N,K]` float32 | Router 权重 | 当前主要保存在 handle 供 combine 使用 |
+| `expert_alignment` | Python `int` | Expert token 数对齐要求 | 当前 C++ intranode 未使用 |
+| `num_worst_tokens` | Python `int` | 预设最大接收 token 数 | 参与 `real_max_bs` 计算，但仍有 D2H 同步 |
+| `config` | `deep_ep.Config` | 性能调优参数 | 当前 intranode 明确使用 `num_sms` |
+| `previous_event` | 可选 event | 前置依赖 | 当前路径未实际等待 |
+| `async_finish` | `bool` | 异步返回 | 当前 event 未实现 |
+| `allocate_on_comm_stream` | `bool` | 通信流内存管理 | 当前路径未实际使用 |
+| `dispatch_wait_recv_cost_stats` | `[P]` int32 | 记录等待各 rank 数据的耗时 | 可选诊断输出 |
+| `quant_mode` | 字符串 | BF16/INT8/MXFP8 等 | 训练首版建议只开放 `"bf16"` |
+
+### A.6 NotifyDispatch：先交换元数据
+
+`Buffer::intranode_dispatch()` 首先调用 `aclnnNotifyDispatch`。这一步主要交换通信元数据，
+不是发送完整 hidden state。
+
+主要输入：
+
+| 参数 | 含义 |
+| --- | --- |
+| `send_data` | 待交换的 Expert 计数、offset 和 rank token 数 |
+| `num_tokens_per_expert` | 当前 rank 发往各 Expert 的路径数 |
+| `send_count` | 元数据元素总数 |
+| `num_tokens` | 当前 rank 的原始 token 数 |
+| `commGroup` | EP HCCL 通信域名称 |
+| `rankSize/rankId` | EP world size 和当前 rank |
+| `round/perRoundTokens` | 长序列分轮参数 |
+
+主要输出：
+
+| 输出 | 形状 | 含义 |
+| --- | --- | --- |
+| `send_data_offset` | `[round,E]` | 当前 rank 向各 Expert 发送数据的起点 |
+| `recv_count` | `[round,E]` | 当前 rank 接收的各 Expert 数据量 |
+| `recv_offset` | `[round,E]` | 接收数据的目标位置 |
+| `expert_global_offset` | `[E_local]` | 每个本地 Expert 在 `recv_x` 中的总起点 |
+| `srcrank_in_expert_offset` | `[E_local*P]` | 每个来源 rank 在某本地 Expert 区域中的起点 |
+| `r_in_srcrank_offset` | `[E_local*P*round]` | 多轮模式的更细粒度接收偏移 |
+| `total_recv_token` | `[1]` | 当前 rank 最终接收的 Expert 路径总数 |
+| `max_bs` | `[1]` | 本次通信需要支持的最大 batch |
+| `recv_tokens_per_expert` | `[round*E_local]` | 每个本地 Expert 接收的 token 数 |
+
+### A.7 CamMoeDispatchNormal：重排并传输数据
+
+NotifyDispatch 完成后，C++ 根据 `total_recv_token` 分配输出，再调用
+`aclnnCamMoeDispatchNormal`。
+
+输入可以分为四组：
+
+```text
+原始数据：
+  x
+  expert_ids（topk_idx 转成 int32）
+
+DispatchLayout 结果：
+  send_token_idx_small
+
+NotifyDispatch 结果：
+  send_data_offset
+  recv_offset
+  recv_count
+  expert_global_offset
+  srcrank_in_expert_offset
+  r_in_srcrank_offset
+
+通信和运行属性：
+  EP/TP group、world size、rank
+  num_experts
+  quant_mode
+  real_max_bs/global_bs
+  round/per_round_tokens
+```
+
+输出：
+
+| 输出 | 含义 |
+| --- | --- |
+| `expandx_out` | 最终返回的 `recv_x`，按本地 Expert 连续排列 |
+| `dynamic_scales_out` | INT8/FP8 等量化模式使用的 scale |
+| `expand_idx_out` | combine 需要的来源索引 |
+| `dispatch_wait_recv_cost_stats_out` | 等待各来源 rank 的耗时 |
+
+`expand_idx_out` 中每条 Expert 路径保存三个 `int32`：
+
+```text
+(source_ep_rank, source_token_index, topk_slot)
+```
+
+例如 `(0, 2, 1)` 表示：
+
+```text
+这条 Expert 输入来自 EP rank 0 的第 2 个原始 token，
+对应该 token 的 Top-K 第 1 个位置。
+```
+
+它在 Python `handle` 中被命名为 `recv_src_idx`，是 combine 将 Expert 输出送回原始 token
+的关键依据。
+
+### A.8 dispatch 返回值与 handle
+
+公开接口返回：
+
+```python
+(
+    recv_x,
+    recv_topk_idx,
+    recv_topk_weights,
+    num_recv_tokens_per_expert_list,
+    handle,
+    event,
+)
+```
+
+语义如下：
+
+| 返回值 | 含义 |
+| --- | --- |
+| `recv_x` | `[R,H]`，当前 rank 收到且按本地 Expert 排列的输入 |
+| `recv_topk_idx` | 设计上是接收侧 Expert 索引；当前实现未真正写入 |
+| `recv_topk_weights` | 设计上是接收侧 Router 权重；当前实现未真正写入 |
+| `num_recv_tokens_per_expert_list` | 每个本地 Expert 的 token 数或前缀和，供 GMM 使用 |
+| `handle` | combine 和训练 backward 需要的通信上下文 |
+| `event` | 异步完成事件；当前 default normal 实际为空 |
+
+环境变量 `MOE_EXPERT_TOKEN_NUMS_TYPE=1` 时返回各 Expert 的原始计数；设置为 0 时返回
+前缀和。例如原始计数 `[120,87]` 对应前缀和 `[120,207]`。
+
+当前 intranode handle 为：
+
+```python
+handle = (
+    rank_prefix_matrix,
+    channel_prefix_matrix,
+    recv_channel_prefix_matrix,
+    recv_src_idx,
+    is_token_in_rank,
+    send_head,
+    topk_idx,
+    topk_weights,
+)
+```
+
+当前 combine 真正使用的主要字段是：
+
+```text
+recv_src_idx
+send_head
+topk_idx
+topk_weights
+```
+
+前三个 prefix matrix 在当前 intranode C++ 中仅通过 `at::empty()` 分配，没有被
+dispatch 算子写入；它们主要是为兼容原 DeepEP handle 结构保留的占位字段。
+
+### A.9 当前实现中确认的训练缺口
+
+#### A.9.1 `recv_topk_idx/recv_topk_weights` 只分配未写入
+
+C++ 使用 `at::empty()` 分配二者，但调用 `aclnnCamMoeDispatchNormal` 时没有将它们作为
+输出传入算子。因此当前值是未初始化内容，不能作为训练数据使用。现有测试也基本使用 `_`
+忽略这两个返回值。
+
+训练侧若需要接收路径对应的 Router 权重，首版可以利用
+`recv_src_idx=(source_rank, token_index, topk_slot)` 增加独立 sideband 通信，确认语义后
+再考虑融合进 dispatch kernel。
+
+#### A.9.2 handle 缓存接口尚未完成
+
+虽然公开接口允许 `dispatch(handle=...)`，当前 default normal 策略遇到非空 handle 会直接
+抛出 `NotImplementedError`。C++ 中也保留了 cached layout 参数，但 Python 当前固定传
+`0/None/None`。
+
+#### A.9.3 event/stream 语义尚未完成
+
+当前 `EventOverlap.current_stream_wait()` 是空操作，C++ normal 路径没有返回实际 event。
+因此 `async_finish=True` 暂不能作为通信计算 overlap 已正确实现的依据。
+
+#### A.9.4 存在 D2H/CPU 同步
+
+当前 C++ 路径包含：
+
+```cpp
+max_bs.item<int>()
+total_recv_token.item<int>()
+recv_tokens_per_expert.to(at::kCPU)
+```
+
+第一版正确性 POC 可以接受，但会影响通信计算掩盖、图模式和动态 shape 性能。
+
+#### A.9.5 没有 autograd
+
+`Buffer.dispatch()` 是普通 Python → pybind → C++ 扩展调用，没有
+`torch.autograd.Function` 或 autograd 注册。直接迁移 forward 代码可以让接口跑通，但不能
+自动完成训练反向。
+
+### A.10 建议的迁移接口
+
+为实现 DeepEP drop-in，wheel 的 Python 模块名和公开方法应继续保持：
+
+```python
+import deep_ep
+
+buffer = deep_ep.Buffer(ep_group)
+```
+
+原始兼容接口：
+
+```python
+(
+    num_tokens_per_rank,
+    num_tokens_per_rdma_rank,
+    num_tokens_per_expert,
+    is_token_in_rank,
+    event,
+) = buffer.get_dispatch_layout(topk_idx, num_experts)
+
+(
+    recv_x,
+    recv_topk_idx,
+    recv_topk_weights,
+    tokens_per_expert,
+    handle,
+    event,
+) = buffer.dispatch(
+    x=x,
+    num_tokens_per_rank=num_tokens_per_rank,
+    num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+    num_tokens_per_expert=num_tokens_per_expert,
+    is_token_in_rank=is_token_in_rank,
+    topk_idx=topk_idx,
+    topk_weights=topk_weights,
+    quant_mode="bf16",
+)
+```
+
+首版实现可以明确限定：
+
+```text
+normal 模式
+BF16
+handle=None
+async_finish=False
+单机 HCCS
+A3/A5
+```
+
+但应保留全部参数名称和六个返回值的位置，避免 MindSpeed 集成后再次修改调用点。
+
+可以额外提供训练便利接口，但不能取代兼容 API：
+
+```python
+recv_x, tokens_per_expert, dispatch_ctx = deep_ep.dispatch_for_training(
+    buffer=buffer,
+    x=x,
+    topk_idx=topk_idx,
+    topk_weights=topk_weights,
+    num_experts=num_experts,
+)
+```
+
+它内部完成 layout、raw dispatch，并保存反向所需 handle。
+
+### A.11 dispatch 的训练反向
+
+若 dispatch 只负责 token 搬运和重排，其反向是把 Expert 输入梯度沿原路径归并回 token
+所在 rank：
+
+```text
+正向 dispatch：
+  原始 token → 按 Expert 重排并发送到目标 rank
+
+反向：
+  Expert 输入梯度 → 按来源索引送回原 rank 并累加
+```
+
+因此 `dispatch.backward` 可以复用“不乘 Router 权重的 combine”：
+
+```python
+class DispatchFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, ...):
+        recv_x, _, _, counts, handle, _ = buffer.dispatch(...)
+        ctx.handle = handle
+        return recv_x, counts
+
+    @staticmethod
+    def backward(ctx, grad_recv_x, _):
+        grad_x, _, _ = buffer.combine(
+            grad_recv_x,
+            handle=ctx.handle,
+            topk_weights=None,
+        )
+        return grad_x, ...
+```
+
+但当前 Python `DefaultNormalCommStrategy._intranode_combine()` 会忽略调用者传入的
+`topk_weights`，固定取 handle 中的原始 Router 权重；底层 C++ 虽支持权重为空时使用全 1，
+Python 层却没有把 `None` 传下去。因此实现 dispatch 反向前必须先修正 combine 的权重选择：
+
+```text
+普通 forward combine：使用 Router 权重
+dispatch backward：使用全 1，不能重复乘 Router 权重
+```
+
+`topk_idx` 是离散索引，没有梯度。Router 权重梯度属于 weighted combine 的反向，不应由
+dispatch 本身产生。
+
+### A.12 dispatch 需要迁移的代码范围
+
+不能只复制 `cam_moe_dispatch_normal`，至少要覆盖：
+
+```text
+Python API/策略：
+  python/deep_ep/deep_ep/__init__.py
+  python/deep_ep/deep_ep/buffer.py
+  python/deep_ep/deep_ep/ep_strategy.py
+  python/deep_ep/deep_ep/strategies/normal_strategy.py
+  python/deep_ep/deep_ep/utils.py
+
+Python/C++ 绑定和 runtime：
+  csrc/deepep/pybind_extension.cpp
+  csrc/deepep/deep_ep.hpp
+  csrc/deepep/deep_ep.cpp
+  csrc/deepep/config.hpp
+  csrc/deepep/event.hpp
+  csrc/deepep/pytorch_npu_helper.hpp
+
+DispatchLayout：
+  ops/op_host/op_api/aclnn_dispatch_layout.*
+  ops/op_host/dispatch_layout.cpp
+  ops/op_host/dispatch_layout_tiling.cc
+  ops/op_kernel/dispatch_layout*
+
+NotifyDispatch：
+  ops/op_host/op_api/aclnn_notify_dispatch.*
+  ops/op_host/notify_dispatch.cpp
+  ops/op_host/notify_dispatch_tiling.cc
+  ops/op_kernel/notify_dispatch*
+
+CamMoeDispatchNormal：
+  ops/op_host/op_api/aclnn_cam_moe_dispatch_normal.*
+  ops/op_host/cam_moe_dispatch_normal.cpp
+  ops/op_host/cam_moe_dispatch_normal_tiling.cc
+  ops/op_kernel/cam_moe_dispatch_normal*
+
+构建和发布：
+  公共通信/tiling 头文件
+  CMake 和算子构建脚本
+  OPP 安装目录
+  op_api 动态库
+  deep_ep wheel 打包逻辑
+```
+
+建议先保留 MIT 许可证和原版权声明，整体复制三个算子流水线与最小 adapter，在新仓中裁剪
+low-latency/fused 等首版不需要的路径。等 BF16 forward 和 backward 正确性闭环后，再决定
+是否补量化、handle cache、异步 event 和跨机路径。
+
+## 附录 B：关键源码位置
 
 ### `sgl-kernel-npu`
 
