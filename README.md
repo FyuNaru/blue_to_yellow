@@ -21,3 +21,8 @@ See [moe_learning_closures](./moe_learning_closures) for four small PyTorch exam
 See [torchtitanturbo_fsdpturbo_qwen35_runbook.md](./torchtitanturbo_fsdpturbo_qwen35_runbook.md)
 for the Qwen3.5 environment check, debug baseline, native FSDP baseline, and
 FSDPTurbo custom FSDP validation commands.
+
+## Normalization backward diagnostics
+
+See [norm_backward_diagnostics](./norm_backward_diagnostics/README.md) for standalone
+NPU/CPU and NVIDIA TE GPU/CPU comparisons of saved FP32 LayerNorm/RMSNorm backward inputs.
