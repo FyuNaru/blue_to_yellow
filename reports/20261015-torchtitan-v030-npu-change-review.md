@@ -2,6 +2,28 @@
 
 核对日期：2026-10-15。用于代码评审与后续上游提交筛选。
 
+## 六类用例测试结果总览
+
+**结论：不是六类全部通过。** 第 1、3 类已完成本轮选定且在 v0.3.0 中存在的测试入口；第 2、4、5、6 类有部分通过，同时存在数据阻塞、未覆盖能力或明确失败项。不存在的较新用例不回移、不记为通过。
+
+下表汇总此前保存的验证结果，本次编辑没有重新执行测试。环境以本文“比较范围与验证边界”为准：v0.3.0 适配分支、A5、Inductor **default**、配套 TorchNPU 环境修复；不是社区 main 或 TE 的验证结果。
+
+| 类别 | 当前结论 | 已通过的具体入口 | 未通过、不存在或未覆盖的部分 |
+| --- | --- | --- | --- |
+| 1. Trainer、配置与运行时初始化 | **现有指定入口通过** | `test_trainer.py` 7 项、`test_set_determinism.py` 5 项（CPU/mock）；原始 4 卡 `features/default` 完整 10 步 | v0.3.0 核心仓未找到 TrainerEx；不代表全部配置转换、真实硬件确定性或长期训练已验证。依赖入口导入、RoPE 及环境兼容修复 |
+| 2. 模型构建、训练、验证与梯度累积 | **部分通过；验证受数据阻塞** | Trainer 7 项（与第 1 类重叠）；原始 2 卡 `gradient_accumulation` 完整 10 步 | 8 卡 `validation_tp_cp_pp` 已到训练第 1 步，但 C4 验证数据获取受阻，未完成验证，不记通过；`test_validate.py`、`test_validator_frequency.py` 在 v0.3.0 不存在 |
+| 3. 优化器、调度与梯度裁剪 | **本轮现有选定入口通过** | 优化器参数组 21 项、学习率调度 7 项（CPU），新增设备校验 7 项（CPU/mock）；2 卡 `optimizer_bf16_states` 完整 10 步；4 卡 Kimi Muon 原配方完整 1 步 | Muon 依赖解除 CUDA 限制的修复；1 步是原配方长度，不是长期收敛或 GPU/NPU 逐位对照，也不据此宣称所有优化器/梯度裁剪组合均已覆盖 |
+| 4. 损失、MTP、确定性与 Batch Invariance | **已有入口适配后通过；部分能力未覆盖** | `test_loss.py` 20 项、`test_loss_dtensor.py` 3 项、`test_invalid_loss.py` 4 项、确定性 5 项，共 32 项（CPU/mock 与真实 NPU 分布式混合）；`2d_eager` 两个原始 4 卡配方各 10 步 | 修过测试导入及参考输入布局；原跨布局逐位梯度断言确实失败，不能写成原测试直接通过。V4 MTP/Indexer 对应入口不存在；MoE 辅助损失、Batch Invariance 未获得独立完整验证 |
+| 5. 数据集、Packing、Tokenizer 与多模态数据处理 | **本地/离线指定入口通过；在线部分未验证** | packing 3 项、chat 21 项、多模态预处理 9 项，指定三文件共 33 项；另有数据加载/恢复/tokenizer 离线补充 27 项，均为本地/CPU 数据逻辑，无新增生产修复 | 主动排除 3 项在线 tokenizer 下载测试，不算通过；Grain、Qwen 多模态指定测试在 v0.3.0 不存在。不是多模态 NPU 训练或完整在线 HF 数据验证；C4 数据仍受阻 |
+| 6. 激活检查点、FlexShard、卸载与编译组合 | **部分通过；变长注意力配方明确失败** | AC 4 项、DistMuon 2 项，含 NPU 输出/梯度/内存和真实 2/4 进程 HCCL；原始 4 卡 `1d_compile_sac_op` 完整 10 步 | 依赖测试设备适配和二维 matmul 策略修复。`fsdp+varlen_attn+per_op_sac` 失败于缺少有效的 NPU `aten::_flash_attention_forward` 内核，CPU fallback 也不支持；`test_optimizer_reshard_runtime.py` 不存在；offload 未验证 |
+
+阅读口径：
+
+- “通过”只针对表中列出的入口和运行规模，不等于整类所有能力或完整社区门禁通过；跳过、主动排除、数据阻塞和不存在都不能计为通过。
+- 第 1、2 类的 Trainer，以及第 1、4 类的确定性测试存在重叠；各类数字不要直接累加为独立测试总数。第 3 类新增的 7 项设备校验也不是仓库原有测试。
+- “default”“2d_eager”是原用例名称。其中 `2d_eager` 的部分内部路径仍会编译，不能据名字推断已绕过 Inductor；也不要把用例名 default 与 NPU 后端选择混为一谈。
+- 明确失败项和环境依赖继续保留，本文 8 个 TorchTitan 提交不包含对所有外部依赖的修复。
+
 ## 一、评审结论（省流版）
 
 **v0.3.0 基线保留全部 8 个提交；向社区 main 提交时不能整套照搬。**
