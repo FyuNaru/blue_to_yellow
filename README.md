@@ -1,5 +1,11 @@
 # blue_to_yellow
 
+## TorchTitan v0.3.0 NPU adaptation review
+
+See [TorchTitan v0.3.0 NPU 适配修改说明与社区 main 对比](./reports/20261015-torchtitan-v030-npu-change-review.md)
+for the eight adaptation commits, root causes, line-by-line explanations,
+validation boundaries, and comparison with a pinned community main snapshot.
+
 ## SGL DeepEP training feasibility
 
 See [SGL DeepEP 用于 MindSpeed MoE 训练的阶段性调研报告](./reports/20260724-sgl-deepep-mindspeed-training-feasibility.md)
