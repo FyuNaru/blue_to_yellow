@@ -4,25 +4,107 @@
 
 ## 六类用例测试结果总览
 
-**结论：不是六类全部通过。** 第 1、3 类已完成本轮选定且在 v0.3.0 中存在的测试入口；第 2、4、5、6 类有部分通过，同时存在数据阻塞、未覆盖能力或明确失败项。不存在的较新用例不回移、不记为通过。
+### 先看数量
 
-下表汇总此前保存的验证结果，本次编辑没有重新执行测试。环境以本文“比较范围与验证边界”为准：v0.3.0 适配分支、A5、Inductor **default**、配套 TorchNPU 环境修复；不是社区 main 或 TE 的验证结果。
+**按六类分别列出的 29 项核对对象：✅ 20 项通过，➖ 7 项 v0.3.0 没有，未通过共 2 项（❌ 1 项明确失败 + ⏳ 1 项数据受阻）。**
 
-| 类别 | 当前结论 | 已通过的具体入口 | 未通过、不存在或未覆盖的部分 |
+统计单位是“测试文件 / 集成入口 / 明确点名的 TrainerEx 对象”，不是文件内部的单测条数，也不是训练步数。Trainer 和确定性入口分别在两类中出现，以上按类别重复计数；去掉这两处重复后，为 **27 个不同对象：18 通过、7 不存在、1 失败、1 受阻**。这些数量不包含后面单列的未验证能力与补充测试，不代表全部能力覆盖率。
+
+| 类别 | 核对对象 | ✅ 通过 | ➖ 分支没有 | ❌ 失败 | ⏳ 受阻 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1. Trainer、配置与运行时初始化 | 4 | 3 | 1 | 0 | 0 |
+| 2. 模型构建、训练、验证与梯度累积 | 5 | 2 | 2 | 0 | 1 |
+| 3. 优化器、调度与梯度裁剪 | 4 | 4 | 0 | 0 | 0 |
+| 4. 损失、MTP、确定性与 Batch Invariance | 6 | 5 | 1 | 0 | 0 |
+| 5. 数据集、Packing、Tokenizer 与多模态数据处理 | 5 | 3 | 2 | 0 | 0 |
+| 6. 激活检查点、FlexShard、卸载与编译组合 | 5 | 3 | 1 | 1 | 0 |
+| **按类合计（含重复）** | **29** | **20** | **7** | **1** | **1** |
+
+图例：✅ 已完成列出的验证；➖ 基线缺少该对象，不当成运行失败；❌ 已运行且明确失败；⏳ 被外部条件挡住，尚未完成；❔ 未验证，不能当成通过或不存在。
+
+以下均为此前保存的结果，本次没有重跑。适用环境：v0.3.0 适配分支、A5、Inductor **default** 和配套 TorchNPU 环境修复；不是社区 main 或 TE 的验证结果。
+
+### 再看每一项
+
+#### 1. Trainer、配置与运行时初始化
+
+| 核对对象 | 状态 | 验证结果 / 原因 |
+| --- | --- | --- |
+| `test_trainer.py` | ✅ 通过 | 7 项通过，CPU/mock |
+| `test_set_determinism.py` | ✅ 通过 | 5 项通过，CPU/fake mesh |
+| `features/default` | ✅ 通过 | 原始 4 卡完整 10 步；依赖导入、RoPE 和环境修复 |
+| `TrainerEx` | ➖ 分支没有 | v0.3.0 核心仓未找到该对象；不是脚本运行失败 |
+
+#### 2. 模型构建、训练、验证与梯度累积
+
+| 核对对象 | 状态 | 验证结果 / 原因 |
+| --- | --- | --- |
+| `test_trainer.py` | ✅ 通过 | 7 项通过；与第 1 类重复 |
+| `features/gradient_accumulation` | ✅ 通过 | 原始 2 卡完整 10 步 |
+| `test_validate.py` | ➖ 分支没有 | v0.3.0 没有这个文件 |
+| `test_validator_frequency.py` | ➖ 分支没有 | v0.3.0 没有这个文件 |
+| `features/validation_tp_cp_pp` | ⏳ 受阻，未通过 | 8 卡已完成训练第 1 步，C4 验证数据获取受阻；验证未完成 |
+
+#### 3. 优化器、调度与梯度裁剪
+
+| 核对对象 | 状态 | 验证结果 / 原因 |
+| --- | --- | --- |
+| `test_optimizer_param_groups.py` | ✅ 通过 | 21 项通过，CPU |
+| `test_lr_scheduler.py` | ✅ 通过 | 7 项通过，CPU |
+| `features/optimizer_bf16_states` | ✅ 通过 | 原始 2 卡完整 10 步 |
+| `models/kimi_k2_5_muon_fsdp+ep` | ✅ 通过 | 解除 CUDA 限制后，原始 4 卡配方完整 1 步 |
+
+#### 4. 损失、MTP、确定性与 Batch Invariance
+
+| 核对对象 | 状态 | 验证结果 / 原因 |
+| --- | --- | --- |
+| `test_loss.py` | ✅ 通过 | 20 项通过；修过导入顺序和参考布局，原跨布局逐位梯度测试曾失败 |
+| `test_loss_dtensor.py` | ✅ 通过 | 3 项通过，真实 8 进程 NPU/HCCL |
+| `test_invalid_loss.py` | ✅ 通过 | 4 项通过，CPU/mock |
+| `test_set_determinism.py` | ✅ 通过 | 5 项通过；与第 1 类重复 |
+| `features/2d_eager` | ✅ 通过 | 两个原始 4 卡配方各完整 10 步，合计仍按 1 个入口统计 |
+| `test_deepseek_v4_mtp.py` | ➖ 分支没有 | v0.3.0 没有这个文件；不代表已有 V3 MTP 测试不存在 |
+
+#### 5. 数据集、Packing、Tokenizer 与多模态数据处理
+
+| 核对对象 | 状态 | 验证结果 / 原因 |
+| --- | --- | --- |
+| `test_text_dataset_packing.py` | ✅ 通过 | 3 项通过，本地/CPU |
+| `test_chat_dataset.py` | ✅ 通过 | 21 项通过，本地/CPU |
+| `test_mm_dataset_preprocessing.py` | ✅ 通过 | 9 项通过，本地/CPU；不是多模态 NPU 训练 |
+| `components/data/test_grain_data.py` | ➖ 分支没有 | v0.3.0 没有这个文件 |
+| `test_qwen_multimodal_data.py` | ➖ 分支没有 | v0.3.0 没有这个文件 |
+
+#### 6. 激活检查点、FlexShard、卸载与编译组合
+
+| 核对对象 | 状态 | 验证结果 / 原因 |
+| --- | --- | --- |
+| `test_activation_checkpoint.py` | ✅ 通过 | 设备与策略适配后 4 项通过，含 NPU 输出/梯度/内存检查 |
+| `flex_shard/test_dist_muon.py` | ✅ 通过 | 设备适配后 2 项通过，真实 2/4 进程 NPU/HCCL |
+| `features/1d_compile_sac_op` | ✅ 通过 | 原始 4 卡完整 10 步 |
+| `cpu/flex_shard/test_optimizer_reshard_runtime.py` | ➖ 分支没有 | v0.3.0 没有这个文件 |
+| `features/fsdp+varlen_attn+per_op_sac` | ❌ 失败 | 缺少有效的 NPU aten::_flash_attention_forward 内核，CPU fallback 也不支持 |
+
+### 单独列出：未验证能力与补充检查
+
+这些项目**不计入上面的 29 项对象数量**，避免把“能力”“测试文件”和“单测实例”混成同一单位。
+
+| 所属类 | 能力 / 补充检查 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| 1. Trainer、配置与运行时初始化 | **现有指定入口通过** | `test_trainer.py` 7 项、`test_set_determinism.py` 5 项（CPU/mock）；原始 4 卡 `features/default` 完整 10 步 | v0.3.0 核心仓未找到 TrainerEx；不代表全部配置转换、真实硬件确定性或长期训练已验证。依赖入口导入、RoPE 及环境兼容修复 |
-| 2. 模型构建、训练、验证与梯度累积 | **部分通过；验证受数据阻塞** | Trainer 7 项（与第 1 类重叠）；原始 2 卡 `gradient_accumulation` 完整 10 步 | 8 卡 `validation_tp_cp_pp` 已到训练第 1 步，但 C4 验证数据获取受阻，未完成验证，不记通过；`test_validate.py`、`test_validator_frequency.py` 在 v0.3.0 不存在 |
-| 3. 优化器、调度与梯度裁剪 | **本轮现有选定入口通过** | 优化器参数组 21 项、学习率调度 7 项（CPU），新增设备校验 7 项（CPU/mock）；2 卡 `optimizer_bf16_states` 完整 10 步；4 卡 Kimi Muon 原配方完整 1 步 | Muon 依赖解除 CUDA 限制的修复；1 步是原配方长度，不是长期收敛或 GPU/NPU 逐位对照，也不据此宣称所有优化器/梯度裁剪组合均已覆盖 |
-| 4. 损失、MTP、确定性与 Batch Invariance | **已有入口适配后通过；部分能力未覆盖** | `test_loss.py` 20 项、`test_loss_dtensor.py` 3 项、`test_invalid_loss.py` 4 项、确定性 5 项，共 32 项（CPU/mock 与真实 NPU 分布式混合）；`2d_eager` 两个原始 4 卡配方各 10 步 | 修过测试导入及参考输入布局；原跨布局逐位梯度断言确实失败，不能写成原测试直接通过。V4 MTP/Indexer 对应入口不存在；MoE 辅助损失、Batch Invariance 未获得独立完整验证 |
-| 5. 数据集、Packing、Tokenizer 与多模态数据处理 | **本地/离线指定入口通过；在线部分未验证** | packing 3 项、chat 21 项、多模态预处理 9 项，指定三文件共 33 项；另有数据加载/恢复/tokenizer 离线补充 27 项，均为本地/CPU 数据逻辑，无新增生产修复 | 主动排除 3 项在线 tokenizer 下载测试，不算通过；Grain、Qwen 多模态指定测试在 v0.3.0 不存在。不是多模态 NPU 训练或完整在线 HF 数据验证；C4 数据仍受阻 |
-| 6. 激活检查点、FlexShard、卸载与编译组合 | **部分通过；变长注意力配方明确失败** | AC 4 项、DistMuon 2 项，含 NPU 输出/梯度/内存和真实 2/4 进程 HCCL；原始 4 卡 `1d_compile_sac_op` 完整 10 步 | 依赖测试设备适配和二维 matmul 策略修复。`fsdp+varlen_attn+per_op_sac` 失败于缺少有效的 NPU `aten::_flash_attention_forward` 内核，CPU fallback 也不支持；`test_optimizer_reshard_runtime.py` 不存在；offload 未验证 |
+| 第 4 类 | Indexer 辅助损失指定入口 | ➖ 对应入口缺失 | v0.3.0 没有对应 V4/Indexer 测试入口，不回移 |
+| 第 4 类 | MoE 辅助损失 | ❔ 未独立完整验证 | 不能用 Muon/MoE 训练结果替代该能力的验证 |
+| 第 4 类 | Batch Invariance | ❔ 未完整验证 | 已有相关实验/开关，不应标成“整个功能不存在” |
+| 第 5 类 | 本地加载、数据恢复、tokenizer 离线补充 | ✅ 27 项单测通过 | 补充验证，不重复加到指定三文件的 33 项中 |
+| 第 5 类 | 在线 tokenizer 下载测试 | ❔ 3 项主动排除 | 不是通过，也不是测试框架自动 skip；在线 HF 数据完整链路未验证 |
+| 第 6 类 | offload / 卸载 | ❔ 未验证 | AC 内存检查不等于卸载功能通过 |
+| 第 3 类 | 新增设备存储校验测试 | ✅ 7 项 CPU/mock 通过 | 新加的回归测试，不是仓库原有指定入口，也不是实际 NPU 运算 |
 
-阅读口径：
+注意：
 
-- “通过”只针对表中列出的入口和运行规模，不等于整类所有能力或完整社区门禁通过；跳过、主动排除、数据阻塞和不存在都不能计为通过。
-- 第 1、2 类的 Trainer，以及第 1、4 类的确定性测试存在重叠；各类数字不要直接累加为独立测试总数。第 3 类新增的 7 项设备校验也不是仓库原有测试。
-- “default”“2d_eager”是原用例名称。其中 `2d_eager` 的部分内部路径仍会编译，不能据名字推断已绕过 Inductor；也不要把用例名 default 与 NPU 后端选择混为一谈。
-- 明确失败项和环境依赖继续保留，本文 8 个 TorchTitan 提交不包含对所有外部依赖的修复。
+- “通过”限定于表中运行规模及适配后的版本，不等于整类所有能力、长期收敛、硬件确定性或完整社区门禁通过。
+- `test_loss.py` 的原跨布局逐位梯度比较曾失败；当前通过依赖参考布局调整，不放宽断言，也不声称原比较目标已经满足。
+- 用例名 `2d_eager` 不代表内部完全不编译；用例名 default 与 NPU 后端选项 default 是两个不同概念。
+- 本文的 TorchTitan patch 不包含全部环境修复。明确失败项、受阻项和未验证能力继续保留。
 
 ## 一、评审结论（省流版）
 
