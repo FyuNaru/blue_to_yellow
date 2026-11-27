@@ -154,53 +154,93 @@ Engram 根据最近几个 token 查 Embedding 表。把表按行分给多张卡�
 
 #### Vocabulary Parallelism（VP / V-FSDP）
 
-**优先迁移验证。** **Flash-Next** 的约 95 GiB PLE 表几乎占满一张 96 GiB 卡。若目标是训练这张表，先用缩小表验证按行分片、跨卡查表和梯度更新，再用 VP=8 验收全表。此时权重约 **11.9 GiB/卡**，梯度和优化器状态另计。
+1. **它做什么** 把一张大查找表按行分给多张卡，哪张卡存着要查的行就由哪张卡返回结果，减轻每张卡的显存压力。
+2. **现在支持到哪** **两边都部分支持。** TorchTitan v0.4.0 和 TorchTitan-Ascend 都能用张量并行（TP）切普通 token 的查找表。给 Flash-Next 的 PLE 表（按几个 token 一起查的大表）单独组卡、跨卡查表的路径待接入。
 
-- **FSDPTurbo 配置** `distributed.vocab_parallel_size: 8`（Flash-Next 示例）。`distributed.vp_plan.apply_modules` 指定查找表。二级分片用 `vocab_fully_shard_parallel_size` 和 `vp_plan.apply_vfsdp_modules`。 [VP](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/vocab_parallel.md)
-- **TorchTitan-Ascend（部分已有）** 支持 TP 的配方将 `config.parallelism.tensor_parallel_degree` 设为大于 `1`，普通词嵌入随 TP 分片。Flash-Next 的独立 PLE VP 待接入。 [上游 Embedding](https://github.com/pytorch/torchtitan/blob/45e33cd413b64cb37a7840cfd3c9765d3c639ae1/torchtitan/models/common/embedding.py#L37)
-- **TorchTitan v0.4.0（部分已有）** 普通 TP 可分片 embedding。
+   <details>
+   <summary>查看两边的开关或配方</summary>
+
+   - **FSDPTurbo** `distributed.vocab_parallel_size: 8`（Flash-Next 示例）。`distributed.vp_plan.apply_modules` 指定查找表。二级分片用 `vocab_fully_shard_parallel_size` 和 `vp_plan.apply_vfsdp_modules`。 [VP](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/vocab_parallel.md)
+   - **TorchTitan-Ascend** 支持 TP 的配方将 `config.parallelism.tensor_parallel_degree` 设为大于 `1`，普通词嵌入随 TP 分片。Flash-Next 的独立 PLE VP 待接入。 [上游 Embedding](https://github.com/pytorch/torchtitan/blob/45e33cd413b64cb37a7840cfd3c9765d3c639ae1/torchtitan/models/common/embedding.py#L37)
+
+   </details>
+
+3. **为什么接、在哪个模型上试** **优先在 Qwen3.8-Flash-Next 上接。** 这张表光 BF16 权重就约 **95 GiB**。分给 8 张卡后，权重约 **11.9 GiB/卡**，其他模型层可以继续用原有的并行方式。先用小表确认查出来的向量和训练更新都正确，再扩到全表。 [Flash-Next 模型说明](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#model-overview) · [Turbo 默认配方](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/examples/qwen3_8/config.yaml#L96)
 
 #### Chunk Loss / CCE
 
-**先定位输出层瓶颈。** **K3.1 Reduced、DeepSeek V4.1 Debug** 先测打分与交叉熵的峰值，再决定是否融合。随后验证 **Flash-Next** 的 248,320 项词表。开启 MTP 或词表张量并行时，分别核对额外损失和分片梯度。
+1. **它做什么** CCE 把模型给词表里的候选 token 打分和计算预测误差合在一起做，减少保存临时分数占用的显存。
+2. **现在支持到哪** **两边都部分支持。** TorchTitan v0.4.0 已经能把 token 分批来算损失，TorchTitan-Ascend 的 K3.1、V4.1、Qwen3.8 配方已经使用。两边都未见 Turbo 这种融合打分与损失计算的 CCE 路径。
 
-**CCE 的选型依据。** Turbo 文档将「词表超过 10 万」或「序列超过 32K」列为适合做分块损失优化的场景。用它筛选 CCE 对象，最终看调优后的分块 loss 是否仍是显存瓶颈。以每块 1,024 token、每个分数占 2 字节估算，一份中间分数在 K3.1、V4.1、Flash-Next 上分别约为 **320、252.5、485 MiB**。这些数字只估算一份中间张量，实测还要看计算精度和当时同时存活的张量。[Turbo Chunk Loss 适用场景](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/chunk_loss.md#适用场景) · [CCE 实现](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/fsdp_turbo/memory/chunk_loss/chunkloss_cce_fused.py)
+   <details>
+   <summary>查看两边的开关或配方</summary>
 
-- **FSDPTurbo 配置** 分块 Loss 用 `memory.chunk_loss: true`，块大小用 `memory.chunk_loss_size`。融合 CCE 的代码入口是 `chunk_loss_cce_fused()`，本版配方未提供开关。 [Chunk Loss](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/chunk_loss.md) · [CCE 源码](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/fsdp_turbo/memory/chunk_loss/chunkloss_cce_fused.py)
-- **TorchTitan-Ascend（部分已有）** `deepseek_v4_1_debugmodel_npu`、`kimi_k3_1_reduced_npu` 和 `qwen38_debugmodel_npu` 等配方已用 `ChunkedLossWrapper.Config`。`config.loss.num_chunks` 调分块数，融合 CCE 待评估。 [V4.1 loss 配置](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/torchtitan_ascend_recipes/models/deepseek_v4_1.py#L84)
-- **TorchTitan v0.4.0（部分已有）** 有分块 loss，未见同类融合 CCE 配方。
+   - **FSDPTurbo** 分块 Loss 用 `memory.chunk_loss: true`，块大小用 `memory.chunk_loss_size`。融合 CCE 的代码入口是 `chunk_loss_cce_fused()`，本版配方未提供开关。 [Chunk Loss](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/chunk_loss.md) · [CCE 源码](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/fsdp_turbo/memory/chunk_loss/chunkloss_cce_fused.py)
+   - **TorchTitan-Ascend** `deepseek_v4_1_debugmodel_npu`、`kimi_k3_1_reduced_npu` 和 `qwen38_debugmodel_npu` 等配方已用 `ChunkedLossWrapper.Config`。`config.loss.num_chunks` 调分块数，融合 CCE 待评估。 [V4.1 loss 配置](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/torchtitan_ascend_recipes/models/deepseek_v4_1.py#L84)
+
+   </details>
+
+3. **为什么接、在哪个模型上试** **先测 Kimi K3.1 Reduced 和 DeepSeek V4.1 Debug 的输出层。** 两个模型的词表分别有 **163,840** 和 **129,280** 项。若每块算 1,024 个 token，按每个分数 2 字节估算，单块分数就约占 **320 MiB** 和 **252.5 MiB**。先测现有分块 Loss 调优后还有多少显存压力。瓶颈成立再接 CCE，后续用词表更大的 **Flash-Next（248,320 项，约 485 MiB/块）** 复测，并核对多 token 预测（MTP）的额外损失及词表分片后的梯度。Turbo 文档用词表超过 10 万或序列超过 32K 作为筛选常规分块 Loss 的参考。 [Turbo 分块 Loss 适用场景](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/chunk_loss.md#适用场景)
 
 #### FSDP2 / Communication Prefetch
 
-**先采集现有预取时间线。** **K3 7B 原生 FSDP2 + 常规 EP** 先查权重聚合和专家 token 交换是否相互等待。确认后再改时机，复测 **K3.1 Reduced 或 V4/V4.1**。参数、梯度卸载由已有 Swap Core 推进。
+1. **它做什么** 调整提前拼权重的时间，尽量避开专家正在跨卡交换 token 的时段，减少两批数据同时抢带宽。
+2. **现在支持到哪** **两边都已有基础预取。** TorchTitan v0.4.0 的 FSDP2 会提前准备权重，TorchTitan-Ascend 的 DeepSeek V4.1 还有 HyperParallel 配方自带的预取。两边都未见 Turbo 这种按专家通信完成时机调整预取的逻辑。
 
-- **FSDPTurbo 配置** `distributed.fsdp_plan` 下用 `num_to_forward_prefetch` 和 `num_to_backward_prefetch` 设层数。`prefetch_wait_a2a` 调整前向预取时机，`backward_prefetch_on_moe_input` 调整反向预取时机，两项默认关闭。 [FSDP2 与预取](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/fully_shard_parallel.md#通信预取)
-- **TorchTitan-Ascend（部分已有）** 原生 FSDP2 通过 `config.parallelism.data_parallel_shard_degree` 配分片度，基础预取随 FSDP2 启用。V4.1 可选 `CONFIG=deepseek_v4_1_debugmodel_hyper_npu`，使用 HyperParallel 预取，要求 EP=1。Turbo 按专家通信时机安排预取的逻辑待评估。 [V4.1 配方与依赖](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/docs/models/deepseek_v4_1.md#L7)
-- **TorchTitan v0.4.0（部分已有）** FSDP2、基础预取、CPU 卸载接口。
+   <details>
+   <summary>查看两边的开关或配方</summary>
+
+   - **FSDPTurbo** `distributed.fsdp_plan` 下用 `num_to_forward_prefetch` 和 `num_to_backward_prefetch` 设层数。`prefetch_wait_a2a` 调整前向预取时机，`backward_prefetch_on_moe_input` 调整反向预取时机，两项默认关闭。 [FSDP2 与预取](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/fully_shard_parallel.md#通信预取)
+   - **TorchTitan-Ascend** 原生 FSDP2 通过 `config.parallelism.data_parallel_shard_degree` 配分片度，基础预取随 FSDP2 启用。V4.1 可选 `CONFIG=deepseek_v4_1_debugmodel_hyper_npu`，使用 HyperParallel 预取，要求 EP=1。Turbo 按专家通信时机安排预取的逻辑待评估。 [V4.1 配方与依赖](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/docs/models/deepseek_v4_1.md#L7)
+
+   </details>
+
+3. **为什么接、在哪个模型上试** **先在 Kimi K3 7B 的 FSDP2 + 常规专家并行配方上试。** 看训练时间线上，拼权重和专家交换 token 是否同时占用链路、拖慢了这一层。确有等待再试错开前向或反向的预取，确认整步提速后，在 **K3.1 Reduced 或 DeepSeek V4/V4.1** 复测。参数和梯度卸载由 Swap Core 任务推进。
 
 #### Expert Parallelism / EP Balance
 
-**热点确认后验证。** **K3.1 Reduced** 有 64 个专家、每 token 选 16 个，**V4.1 Flash** 有 384 个、选 6 个。先测常规 All-to-All 下各卡 token 数及耗时，持续存在热点再试专家副本。MoonEP 单独作现有基线。
+1. **它做什么** 当某个专家（处理一部分 token 的小模块）特别忙时，用其他卡上的专家副本分担，减少大家等待的时间。
+2. **现在支持到哪** **两边都已有专家并行。** TorchTitan v0.4.0 能把专家分给多张卡，TorchTitan-Ascend 已有多种把 token 发给专家的实现。两边都未见 Turbo 这套给常规路由动态加副本的机制。
 
-- **FSDPTurbo 配置** `distributed.expert_parallel_size` 设并行度。`distributed.ep_plan.enable_ep_balance: true` 开启动态专家副本，需要 `dispatcher: all2all` 或 `allgather`。 [EP 与负载均衡](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/expert_parallel.md)
-- **TorchTitan-Ascend（部分已有）** `config.parallelism.expert_parallel_degree` 大于 `1` 启用 EP。K3 可用 `CONFIG=kimi_k3_7b_moonep`，或通过 `--override` 选融合 dispatcher 或 MC2。Turbo `enable_ep_balance` 待评估。 [K3 EP 用法](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/docs/models/kimi_k3.md#L216)
-- **TorchTitan v0.4.0（部分已有）** EP 与专家权重分片。
+   <details>
+   <summary>查看两边的开关或配方</summary>
+
+   - **FSDPTurbo** `distributed.expert_parallel_size` 设并行度。`distributed.ep_plan.enable_ep_balance: true` 开启动态专家副本，需要 `dispatcher: all2all` 或 `allgather`。 [EP 与负载均衡](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/expert_parallel.md)
+   - **TorchTitan-Ascend** `config.parallelism.expert_parallel_degree` 大于 `1` 启用 EP。K3 可用 `CONFIG=kimi_k3_7b_moonep`，或通过 `--override` 选融合 dispatcher 或 MC2。Turbo `enable_ep_balance` 待评估。 [K3 EP 用法](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/docs/models/kimi_k3.md#L216)
+
+   </details>
+
+3. **为什么接、在哪个模型上试** **先看 Kimi K3.1 Reduced 和 DeepSeek V4.1 Flash 哪些卡最忙。** 两者分别有 **64 个专家、每个 token 选 16 个**和 **384 个专家、每个 token 选 6 个**。记录每张卡实际处理多少 token、等了多久。只有长期存在特别忙的卡，才试用副本分流，并把 MoonEP 作为单独的现有基线。 [K3.1 配方](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/docs/models/kimi_k3_1.md) · [V4.1 Flash 配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/config.json)
 
 #### Batch Chunking
 
-**显存瓶颈确认后验证。** **K3/K3.1 图文**有独立视觉塔，K3.1 为 27 层。增加每批图片数，确认峰值是否在视觉塔单次前向，再与减小训练微批对照。现行 Turbo 实现要求首轮 CP=1。
+1. **它做什么** 只把最占显存的模块分几批跑，例如把视觉塔一次处理 8 张图改成每次 2 张，最后把结果拼起来。
+2. **现在支持到哪** **两边都能调小整套模型每次处理的数据量。** 训练可以多跑几次小批数据再更新一次权重。按指定模块单独切批的 Turbo 路径，在两边的核对基线里均未见。
 
-- **FSDPTurbo 配置** `memory.chunk_batch: true`。`memory.chunk_batch_plan.apply_modules` 选模块，`chunk_mbs` 设每块样本数。 [Batch Chunking](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/chunk_batch.md)
-- **TorchTitan-Ascend（未见）** 同类模块内切分待评估。训练级微批可用 `config.training.num_tokens_per_microbatch_per_dp_rank` 调整。 [训练配置](https://github.com/pytorch/torchtitan/blob/45e33cd413b64cb37a7840cfd3c9765d3c639ae1/torchtitan/config/configs.py#L37)
-- **TorchTitan v0.4.0（部分已有）** 训练微批和梯度累积。
+   <details>
+   <summary>查看两边的开关或配方</summary>
+
+   - **FSDPTurbo** `memory.chunk_batch: true`。`memory.chunk_batch_plan.apply_modules` 选模块，`chunk_mbs` 设每块样本数。 [Batch Chunking](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/chunk_batch.md)
+   - **TorchTitan-Ascend** 同类模块内切分待评估。训练级微批可用 `config.training.num_tokens_per_microbatch_per_dp_rank` 调整。 [训练配置](https://github.com/pytorch/torchtitan/blob/45e33cd413b64cb37a7840cfd3c9765d3c639ae1/torchtitan/config/configs.py#L37)
+
+   </details>
+
+3. **为什么接、在哪个模型上试** **先测 Kimi K3/K3.1 的图文训练。** K3.1 有 **27 层视觉编码器**。每批图片变多时，如果显存最高点出现在视觉塔，就比较「只切视觉塔」和「整套模型每次都少算一些样本」，看哪一种在省显存的同时能保持吞吐。Turbo 当前的模块内切批要求 **CP=1**，即首轮先不跨卡切长序列。 [K3.1 模型规格](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/docs/models/kimi_k3_1.md#L7)
 
 #### TileKernels
 
-**按算子瓶颈评估。** **V4.1** 先分析 mHC post 占整步多少时间。瓶颈成立时，比较 TileKernels 与已合入的 AscendC。Engram Gate 由原任务评估。
+1. **它做什么** 用另一套算子实现加快 DeepSeek V4.1 的 mHC post，也就是把本层算出的结果混回四路跨层保留的信息。
+2. **现在支持到哪** **TorchTitan v0.4.0 未见 TileKernels 后端。** TorchTitan-Ascend **部分支持**，V4.1 原生和 HyperParallel Debug 配方已用 AscendC 实现 mHC pre/post，可以拿来做对照。
 
-- **FSDPTurbo 配置** `ops.mhc_post: tilekernels` 选择 mHC post 算子。V4.1 的 Engram Gate 用 `model.engram_gate_impl: tilekernels`。 [TileKernels](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/tilekernels.md)
-- **TorchTitan-Ascend（部分已有）** V4.1 的原生与 HyperParallel Debug 配方均已启用 AscendC 的 mHC pre/post。Turbo TileKernels 路径待评估。 [V4.1 算子选择](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/torchtitan_ascend_recipes/models/deepseek_v4_1.py#L51)
-- **TorchTitan v0.4.0（未见）** 该版本未见与 TileKernels 对应的后端。
+   <details>
+   <summary>查看两边的开关或配方</summary>
+
+   - **FSDPTurbo** `ops.mhc_post: tilekernels` 选择 mHC post 算子。V4.1 的 Engram Gate 用 `model.engram_gate_impl: tilekernels`。 [TileKernels](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/tilekernels.md)
+   - **TorchTitan-Ascend** V4.1 的原生与 HyperParallel Debug 配方均已启用 AscendC 的 mHC pre/post。Turbo TileKernels 路径待评估。 [V4.1 算子选择](https://gitcode.com/Ascend/torchtitan-ascend/blob/6c628066864f0d190bb94a494d34c5c4de1f193c/torchtitan_ascend_recipes/models/deepseek_v4_1.py#L51)
+
+   </details>
+
+3. **为什么接、在哪个模型上试** **先在 DeepSeek V4.1 的 A5 配方测 mHC post 占整步多少时间。** Turbo 的历史算子对照在 batch 为 1 时，8K token 的前后向约是 CANN 实现的 **1.82 倍速度**，1K token 时则更慢。若目标模型在较长序列下确实花了不少时间在这一算子，再与现有 AscendC 路径比整步吞吐。Engram Gate 由已有的 Engram 任务评估。 [Turbo 历史算子对照](https://gitcode.com/Ascend/FSDPTurbo/blob/8494fffb2c5d19aa882c4ba40ad84f94a0648ed0/docs/zh/features/tilekernels.md#L81)
 
 ### 3.3 沿用已排期任务
 
